@@ -14,5 +14,5 @@ fn main() {
     cluster.tick();
 
     let message = client.recv().unwrap();
-    println!("Received response from cluster {}", message);
+    println!("Received response from cluster {:?}", message);
 }

@@ -6,47 +6,50 @@ use std::{
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use thiserror::Error;
 
-/// VSR (Viewstamped Replication Revisited)
-/// * Normal protocol
-/// * View change protocol
-/// * Recovery protocol
-///
-/// Primary is determined by the view number and the configuration.
-/// The replicas are numbered starting with replica 1, which is the initial primary.
-/// Replicas have an internal state to describe their availability.
-/// State *normal* means the replica is available.
-///
-/// The client-proxy knows who the primary is and sends messages accordingly.
-/// All requests sent by the client are given a number to understand ordering.
-/// The client also sends its current known view number together with the message.
-/// The primary replica can check that the view number matches with the one known by the client.
-/// If the client is behind, the receiver drops the message.
-/// If the client is ahead, the replica performs a "state transfer":
-///     - it requests information it is missing from the other replicas and uses this information to bring itself up to date before processing the message.
-///
-/// Normal protocol
-///  1. Client sends a message <Request, operation (with arguments), client_id, request_number>.
-///  2. When the primary receives the message it compares the request number to the internal client_table.
-///     a. If the request number is smaller, the table drops the request.
-///     b. If it's equal it will re-send the same response that has been executed previously.
-///     c. If the request number is bigger, (3)
-///  3. The primary advances the operation_number, adds the request to the end of the log and updates the information for this client.
-///     Then, it sends a <Prepare, view_number, message_client, request_operation_number, commit_number>
-///  4. The backup replicas process the Prepare messages in order:
-///     - A backup replica won't accept a prepare with an operation_number until it has entries for all earlier requests in its log.
-///     Once all previous requests are available:
-///     a. The operation_number is increased
-///     b. The request is added to the end of its log
-///     c. Updates the client's information in the client table
-///     d. Sends a <PrepareOk, view_number, operation_number, replica_number> message to the primary to indicate that this operation has been processed.
-///  5. Primary waits for `f`  PrepareOk messages from the different backup replicas. Once that happens, the operation is considered to be successful and thus marked as committed. Then, after it has executed all earlier operations
-///     a. The primary executes the operation by making an up-call to the service code.
-///     b. Increments its commit_number
-///     c. Sends a <Reply, view_number, client_request_id, payload>.
-///     d. The primary updates the client's table to contain the payload.
-///  6. The primary informs the backup replicas about the commit when it sends the next Prepare message. However, if the primary does not receive a new client request in a while, it pro-actively informs the backup replicas about the latest commit with a message <Commit, view_number, commit_number>
-///  7. When a backup learns of a commit, it waits until it has the request in its log and until it has executed all earlier operations. Then it executes the operation by performing the up-call to the service code, increments its commit-number, updates the client's entry in the client table, but does not send the reply to the client.
-///  8. If a client doesn't receive a timeline response to a request, it re-sends the request to all replicas. This way if the grouped has moved to a later view, its message will reach the new primary. Backups ignore client requests; only the primary processes them.
+/* VSR (Viewstamped Replication Revisited)
+
+Protocols
+ * Normal protocol
+ * View change protocol
+ * Recovery protocol
+
+Primary is determined by the view number and the configuration.
+The replicas are numbered starting with replica 1, which is the initial primary.
+Replicas have an internal state to describe their availability.
+State *normal* means the replica is available.
+
+The client-proxy knows who the primary is and sends messages accordingly.
+All requests sent by the client are given a number to understand ordering.
+The client also sends its current known view number together with the message.
+The primary replica can check that the view number matches with the one known by the client.
+If the client is behind, the receiver drops the message.
+If the client is ahead, the replica performs a "state transfer":
+ - it requests information it is missing from the other replicas and uses this information to bring itself up to date before processing the message.
+
+Normal protocol
+ 1. Client sends a message <Request, operation (with arguments), client_id, request_number>.
+ 2. When the primary receives the message it compares the request number to the internal client_table.
+    a. If the request number is smaller, the table drops the request.
+    b. If it's equal it will re-send the same response that has been executed previously.
+    c. If the request number is bigger, (3)
+ 3. The primary advances the operation_number, adds the request to the end of the log and updates the information for this client.
+    Then, it sends a <Prepare, view_number, message_client, request_operation_number, commit_number>
+ 4. The backup replicas process the Prepare messages in order:
+    - A backup replica won't accept a prepare with an operation_number until it has entries for all earlier requests in its log.
+    - Once all previous requests are available:
+      a. The operation_number is increased
+      b. The request is added to the end of its log
+      c. Updates the client's information in the client table
+      d. Sends a <PrepareOk, view_number, operation_number, replica_number> message to the primary to indicate that this operation has been processed.
+ 5. Primary waits for `f`  PrepareOk messages from the different backup replicas. Once that happens, the operation is considered to be successful and thus marked as committed. Then, after it has executed all earlier operations
+    a. The primary executes the operation by making an up-call to the service code.
+    b. Increments its commit_number
+    c. Sends a <Reply, view_number, client_request_id, payload>.
+    d. The primary updates the client's table to contain the payload.
+ 6. The primary informs the backup replicas about the commit when it sends the next Prepare message. However, if the primary does not receive a new client request in a while, it pro-actively informs the backup replicas about the latest commit with a message <Commit, view_number, commit_number>
+ 7. When a backup learns of a commit, it waits until it has the request in its log and until it has executed all earlier operations. Then it executes the operation by performing the up-call to the service code, increments its commit-number, updates the client's entry in the client table, but does not send the reply to the client.
+ 8. If a client doesn't receive a timeline response to a request, it re-sends the request to all replicas. This way if the grouped has moved to a later view, its message will reach the new primary. Backups ignore client requests; only the primary processes them.
+*/
 
 /// A single replica
 struct Replica {
@@ -80,7 +83,7 @@ struct Replica {
 
     /// For each client, the number of its most recent request, plus,
     /// if the request has been executed, the result sent for that request.
-    client_table: ClientTable,
+    client_table: HashMap<usize, ClientTableEntry>,
 
     network: ReplicaNetwork,
 }
@@ -96,7 +99,7 @@ impl Replica {
             log: Log::default(),
             commit_number: 0,
             acks: HashMap::default(),
-            client_table: ClientTable::default(),
+            client_table: HashMap::default(),
             network,
         }
     }
@@ -108,158 +111,180 @@ impl Replica {
         );
 
         match message {
-            Message::Request {
-                view,
-                request_number,
-                client_id,
-            } => self.handle_request(view, request_number, client_id),
-            Message::Prepare {
-                view,
-                operation_number,
-                client_id,
-            } => self.handle_prepare(view, operation_number, client_id),
-            Message::PrepareOk {
-                view,
-                operation_number,
-                replica_number,
-                client_id,
-            } => self.handle_prepare_ok(view, operation_number, replica_number, client_id),
-            Message::Commit {
-                view,
-                operation_number,
-            } => self.handle_commit(view, operation_number),
-            Message::Reply { .. } => Ok(()),
+            Message::Request(request) => self.handle_request(request),
+            Message::Prepare(prepare) => self.handle_prepare(prepare),
+            Message::PrepareOk(prepare_ok) => self.handle_prepare_ok(prepare_ok),
+            Message::Commit(commit) => self.handle_commit(commit),
+            Message::Reply { .. } => {
+                unreachable!("Reply messages should be sent to the client")
+            }
         }
     }
 
-    fn handle_request(
-        &mut self,
-        view: usize,
-        request_number: usize,
-        client_id: usize,
-    ) -> Result<(), ReplicaError> {
+    fn handle_request(&mut self, request: RequestMessage) -> Result<(), ReplicaError> {
         // Backup replicas ignore client request message.
-        if self.view != view {
+        if self.replica_number != request.view {
             return Ok(());
         }
 
-        // TODO: If the request-number s isn’t bigger than the information in the table it drops the
+        // If the request-number isn’t bigger than the information in the client table it drops the
         // request, but it will re-send the response if the request is the most recent one from this
         // client and it has already been executed.
+        if let Some(most_recent_request) = self.client_table.get(&request.client_id) {
+            if most_recent_request.request_number > request.request_number {
+                return Ok(());
+            }
 
-        let message = Message::Prepare {
-            view,
-            operation_number: self.operation_number,
-            client_id,
-        };
+            if most_recent_request.request_number == request.request_number {
+                if let Some(result) = most_recent_request.response {
+                    let message = Message::Reply(ReplyMessage {
+                        view: request.view,
+                        request_number: most_recent_request.request_number,
+                        result,
+                    });
+                    return self.network.client.send_out(message, request.client_id);
+                }
+            }
+        }
 
-        // Advance the operation number and add the request to the end of the log
+        // Advance the operation number adds the request to the end of the log, and updates the
+        // information for this client in the client-table to contain the new request number
         self.operation_number += 1;
-        self.log.append(request_number);
+        self.log.append(request.request_number);
+        self.client_table.insert(
+            request.client_id,
+            ClientTableEntry {
+                request_number: request.request_number,
+                response: None,
+            },
+        );
 
         // Broadcast message to the backup replicas
+        let message = Message::Prepare(PrepareMessage {
+            view: request.view,
+            operation_number: self.operation_number,
+            commit_number: self.commit_number,
+            request,
+        });
+
         self.network.broadcast(&message)
     }
 
-    fn handle_prepare(
-        &mut self,
-        view: usize,
-        operation_number: usize,
-        client_id: usize,
-    ) -> Result<(), ReplicaError> {
-        if self.operation_number < operation_number {
-            // TODO: waits until it has entries in its log for all earlier requests
-            // (doing state transfer if necessary to get the missing information).
+    fn handle_prepare(&mut self, prepare: PrepareMessage) -> Result<(), ReplicaError> {
+        // `Prepare` messages must only be received by backup replicas
+        assert!(self.replica_number != prepare.view);
+
+        // Update the commit number from the primary committed in a previous request.
+        self.commit_number = prepare.commit_number;
+
+        // The operation has already been processed by the replica. The message is duplicate and will be ignored.
+        if self.operation_number + 1 > prepare.operation_number {
             return Ok(());
         }
 
-        // The operation has already been processed by the replica. The message will be ignored.
-        if self.operation_number > operation_number {
+        // Replica is missing some operations, we should initiate state transfer
+        if self.operation_number + 1 < prepare.operation_number {
+            // TODO: implement state transfer protocol
             return Ok(());
         }
 
-        let message = Message::PrepareOk {
-            view,
-            operation_number,
-            replica_number: self.replica_number,
-            client_id,
-        };
+        // Advance the operation number
+        assert!(self.operation_number + 1 == prepare.operation_number);
+        self.operation_number = prepare.operation_number;
 
-        // Advance the operation number and add the request to the end of the log
-        self.operation_number += 1;
-        // self.log.append(request_number); // TODO: we should have the request number in the prepare message?
+        // Add the request to the end of the log
+        self.log.append(prepare.request.request_number);
 
-        self.network.send(message, &self.view)
+        // Send a prepare ok message to the primary
+        self.network.send(
+            Message::PrepareOk(PrepareOkMessage {
+                view: prepare.view,
+                operation_number: prepare.operation_number,
+                replica_number: self.replica_number,
+                client_id: prepare.request.client_id,
+            }),
+            &self.view,
+        )
     }
 
-    fn handle_prepare_ok(
-        &mut self,
-        view: usize,
-        operation_number: usize,
-        replica_number: usize,
-        client_id: usize,
-    ) -> Result<(), ReplicaError> {
-        if self.view != view {
-            return Ok(());
-        }
+    fn handle_prepare_ok(&mut self, prepare_ok: PrepareOkMessage) -> Result<(), ReplicaError> {
+        // `PrepareOk` messages must only be received by the primary
+        assert!(self.replica_number == prepare_ok.view);
 
-        let ack = self.acks.entry(operation_number).or_insert(Ack::Waiting {
-            replicas: HashSet::with_capacity(self.total),
-        });
+        // The primary waits for at least a quorum amount of `PrepareOk` messages
+        // from different backups
+        let ack = self
+            .acks
+            .entry(prepare_ok.operation_number)
+            .or_insert(Ack::Waiting {
+                replicas: HashSet::with_capacity(self.total),
+            });
 
         let ack_replicas = match ack {
             Ack::Waiting { replicas } => replicas,
             Ack::Executed => return Ok(()),
         };
 
-        ack_replicas.insert(replica_number);
+        ack_replicas.insert(prepare_ok.replica_number);
 
+        // Quorum not reached yet. Primary waits for more `PrepareOk` messages
         if ack_replicas.len() < quorum(self.total) {
             return Ok(());
         };
 
-        self.execute(view, operation_number, client_id)?;
+        // Execute the query
+        let result = self.execute();
 
-        self.acks.insert(operation_number, Ack::Executed);
+        // Increment commit_number
+        self.commit_number += 1;
+        self.acks.insert(prepare_ok.operation_number, Ack::Executed);
+
+        let request = self.client_table.get_mut(&prepare_ok.client_id)
+            .expect("Client must be present in the client table since the request message has been already received");
+
+        // Send reply message to the client
+        self.network.client.send_out(
+            Message::Reply(ReplyMessage {
+                view: prepare_ok.view,
+                request_number: request.request_number,
+                result,
+            }),
+            prepare_ok.client_id,
+        )?;
+
+        // The primary also updates the client's entry in the client-table to contain the result
+        request.response = Some(result);
 
         Ok(())
     }
 
-    fn handle_commit(&mut self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
-        self.commit_number = operation_number;
+    fn handle_commit(&mut self, message: CommitMessage) -> Result<(), ReplicaError> {
+        self.commit_number = message.operation_number;
 
         Ok(())
     }
 
-    fn execute(
-        &mut self,
-        view: usize,
-        operation_number: usize,
-        client_id: usize,
-    ) -> Result<(), ReplicaError> {
-        self.commit_number = operation_number;
-
+    fn execute(&self) -> () {
         // TODO: here we run the service logic and build response
+        ()
+    }
 
-        let message = Message::Reply { view };
+    fn send_commit(&self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
+        // `Commit` messages must only be received by the primary
+        assert!(self.replica_number == view);
 
-        self.network.client.send_out(message, client_id)
+        let message = Message::Commit(CommitMessage {
+            view,
+            operation_number,
+        });
 
-        // TODO: The primary also updates the client’s entry in the client-table to contain the result.
+        self.network.broadcast(&message)
     }
 
     fn tick(&mut self) {
         while !self.network.client.incoming.1.is_empty() {
             let message = match self.network.client.incoming.1.recv().unwrap() {
-                ClientMessage::Request {
-                    view,
-                    request_number,
-                    client_id,
-                } => Message::Request {
-                    view,
-                    request_number,
-                    client_id,
-                },
+                ClientMessage::Request(request) => Message::Request(request),
                 ClientMessage::Response { .. } => {
                     unreachable!("Replica should not receive a client response message")
                 }
@@ -277,41 +302,60 @@ impl Replica {
 
 #[derive(Debug, Clone)]
 enum Message {
-    Request {
-        view: usize,
-        request_number: usize,
-        client_id: usize,
-    },
-    Prepare {
-        view: usize,
-        operation_number: usize,
-        client_id: usize,
-    },
-    PrepareOk {
-        view: usize,
-        operation_number: usize,
-        replica_number: usize,
-        client_id: usize,
-    },
-    Commit {
-        view: usize,
-        operation_number: usize,
-    },
-    Reply {
-        view: usize,
-    },
+    Request(RequestMessage),
+    Prepare(PrepareMessage),
+    PrepareOk(PrepareOkMessage),
+    Commit(CommitMessage),
+    Reply(ReplyMessage),
+}
+
+#[derive(Debug, Clone)]
+struct PrepareMessage {
+    view: usize,
+    operation_number: usize,
+    commit_number: usize,
+    request: RequestMessage,
+}
+
+#[derive(Debug, Clone)]
+struct PrepareOkMessage {
+    view: usize,
+    operation_number: usize,
+    replica_number: usize,
+    client_id: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CommitMessage {
+    view: usize,
+    operation_number: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReplyMessage {
+    view: usize,
+    request_number: usize,
+    result: (),
 }
 
 #[derive(Debug, Clone)]
 enum ClientMessage {
-    Request {
-        view: usize,
-        request_number: usize,
-        client_id: usize,
-    },
-    Response {
-        view: usize,
-    },
+    Request(RequestMessage),
+    Response(ClientResponse),
+}
+
+#[derive(Debug, Clone)]
+struct RequestMessage {
+    view: usize,
+    request_number: usize,
+    client_id: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ClientResponse {
+    view: usize,
+    request_number: usize,
+    result: (),
 }
 
 #[derive(Debug, Default)]
@@ -337,12 +381,6 @@ struct LogEntry {
     request_number: usize,
     // The client ID that triggered the request.
     // client_id: usize,
-}
-
-#[derive(Debug, Default)]
-struct ClientTable {
-    /// A key-value map connecting a `client_id` to its most recent request.
-    inner: HashMap<usize, ClientTableEntry>,
 }
 
 #[derive(Debug)]
@@ -408,7 +446,7 @@ impl ReplicaNetwork {
     fn for_replica(
         replica: usize,
         client: ClientConnection,
-        channels: &Vec<(Sender<Message>, Receiver<Message>)>,
+        channels: &[(Sender<Message>, Receiver<Message>)],
     ) -> Self {
         let mut other = HashMap::with_capacity(channels.len() - 1);
         for (i, (tx, _)) in channels.iter().enumerate() {
@@ -440,7 +478,7 @@ impl ReplicaNetwork {
     }
 
     fn broadcast(&self, message: &Message) -> Result<(), ReplicaError> {
-        for (_, sender) in &self.other {
+        for sender in self.other.values() {
             sender
                 .send(message.clone())
                 .map_err(|_| ReplicaError::NetworkError)?;
@@ -496,10 +534,11 @@ impl Cluster {
     }
 
     fn primary(&self) -> usize {
-        let total = self.replicas.len();
-        let majority = quorum(total) + 1;
-
         assert!(!self.replicas.is_empty());
+
+        let total = self.replicas.len();
+
+        let majority = quorum(total) + 1;
 
         let mut views = HashMap::<usize, usize>::new();
         for replica in &self.replicas {
@@ -563,11 +602,11 @@ impl Client {
 
         self.channel
             .0
-            .send(ClientMessage::Request {
+            .send(ClientMessage::Request(RequestMessage {
                 client_id: self.client_id,
                 view: self.view,
                 request_number: *request_number,
-            })
+            }))
             .map_err(|_| ClientError::NetworkError)?;
 
         *request_number += 1;
@@ -575,15 +614,15 @@ impl Client {
         Ok(())
     }
 
-    pub fn recv(&self) -> Result<usize, ClientError> {
+    pub fn recv(&self) -> Result<(), ClientError> {
         let message = self
             .channel
             .1
             .recv()
             .map_err(|_| ClientError::NetworkError)?;
 
-        if let Message::Reply { view } = message {
-            return Ok(view);
+        if let Message::Reply(reply) = message {
+            return Ok(reply.result);
         }
 
         unreachable!("Client received another message than a reply");
@@ -600,28 +639,4 @@ pub enum ReplicaError {
 pub enum ClientError {
     #[error("A message could not be sent or received")]
     NetworkError,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lazy_static::lazy_static;
-
-    lazy_static! {
-        static ref CONFIG: Config = Config {
-            addresses: vec!["ip-1".to_string(), "ip-2".to_string(), "ip-3".to_string()]
-        };
-    }
-
-    #[test]
-    fn it_connects_client() {
-        // given
-        let mut cluster = Cluster::new(&CONFIG);
-
-        // when
-        let client = cluster.handshake();
-
-        // then
-        assert_eq!(client.view, 0);
-    }
 }
