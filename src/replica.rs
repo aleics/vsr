@@ -109,7 +109,7 @@ impl Replica {
         // Advance the operation number adds the request to the end of the log, and updates the
         // information for this client in the client-table to contain the new request number
         self.operation_number += 1;
-        self.log.append(request.request_number);
+        self.log.append(&request);
         self.client_table.insert(
             request.client_id,
             ClientTableEntry {
@@ -152,7 +152,7 @@ impl Replica {
         self.operation_number = prepare.operation_number;
 
         // Add the request to the end of the log
-        self.log.append(prepare.request.request_number);
+        self.log.append(&prepare.request);
 
         // Send a prepare ok message to the primary
         self.network.send(
@@ -276,8 +276,11 @@ impl Log {
         Log::default()
     }
 
-    fn append(&mut self, request_number: usize) {
-        let entry = LogEntry { request_number };
+    fn append(&mut self, request: &RequestMessage) {
+        let entry = LogEntry {
+            request_number: request.request_number,
+            client_id: request.client_id,
+        };
         self.entries.push_front(entry);
     }
 }
@@ -286,8 +289,8 @@ impl Log {
 struct LogEntry {
     /// The request number of the log.
     request_number: usize,
-    // The client ID that triggered the request.
-    // client_id: usize,
+    /// The client ID that triggered the request.
+    client_id: usize,
 }
 
 #[derive(Debug)]
