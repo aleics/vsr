@@ -9,7 +9,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct Client {
+pub struct Client<I: Clone, O: Clone> {
     /// Client identification
     client_id: usize,
 
@@ -20,14 +20,14 @@ pub struct Client {
     next_request_number: RefCell<usize>,
 
     /// Communication channel between a client and the replicas
-    channel: (Sender<ClientMessage>, Receiver<Message>),
+    channel: (Sender<ClientMessage<I>>, Receiver<Message<I, O>>),
 }
 
-impl Client {
+impl<I: Clone, O: Clone> Client<I, O> {
     pub(crate) fn new(
         client_id: usize,
         view: usize,
-        channel: (Sender<ClientMessage>, Receiver<Message>),
+        channel: (Sender<ClientMessage<I>>, Receiver<Message<I, O>>),
     ) -> Self {
         Client {
             client_id,
@@ -37,7 +37,7 @@ impl Client {
         }
     }
 
-    pub fn send(&self) -> Result<(), ClientError> {
+    pub fn send(&self, operation: I) -> Result<(), ClientError> {
         let mut request_number = self.next_request_number.borrow_mut();
 
         self.channel
@@ -46,6 +46,7 @@ impl Client {
                 client_id: self.client_id,
                 view: self.view,
                 request_number: *request_number,
+                operation,
             }))
             .map_err(|_| ClientError::NetworkError)?;
 
@@ -54,7 +55,7 @@ impl Client {
         Ok(())
     }
 
-    pub fn recv(&self) -> Result<(), ClientError> {
+    pub fn recv(&self) -> Result<O, ClientError> {
         let message = self
             .channel
             .1

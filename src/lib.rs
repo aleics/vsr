@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use client::Client;
 use crossbeam::channel::unbounded;
-use network::{ClientConnection, Message, ReplicaNetwork};
-use replica::{Replica, quorum};
+use network::{AttachedChannel, ClientConnection, Message, ReplicaNetwork};
+use replica::{Replica, Service, quorum};
 
 /* VSR (Viewstamped Replication Revisited)
 
@@ -52,23 +52,23 @@ Normal protocol
 
 mod client;
 mod network;
-mod replica;
+pub mod replica;
 
 pub struct Config {
     pub addresses: Vec<String>,
 }
 
-pub struct Cluster {
-    replicas: Vec<Replica>,
+pub struct Cluster<S: Clone + Service, I: Clone, O: Clone> {
+    replicas: Vec<Replica<S, I, O>>,
 }
 
-impl Cluster {
-    pub fn new(config: &Config) -> Self {
+impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Cluster<S, I, O> {
+    pub fn new(config: &Config, service: S) -> Self {
         let total = config.addresses.len();
 
         let mut channels = Vec::with_capacity(total);
         for _ in &config.addresses {
-            channels.push(unbounded::<Message>())
+            channels.push(unbounded::<Message<I, O>>())
         }
 
         let client = ClientConnection::new();
@@ -78,16 +78,15 @@ impl Cluster {
             replicas.push(Replica::new(
                 i,
                 total,
+                service.clone(),
                 ReplicaNetwork::for_replica(i, client.clone(), &channels),
             ));
         }
 
-        println!("Cluster created {} replicas.", replicas.len());
-
         Cluster { replicas }
     }
 
-    pub fn handshake(&mut self) -> Client {
+    pub fn handshake(&mut self) -> Client<I, O> {
         let primary = self.primary();
 
         let replica = self
@@ -95,8 +94,7 @@ impl Cluster {
             .get_mut(primary)
             .expect("Primary index not valid");
 
-        let (client_id, channel) = replica.network.client.attach();
-
+        let AttachedChannel { client_id, channel } = replica.network.client.attach();
         Client::new(client_id, replica.view, channel)
     }
 
@@ -104,10 +102,9 @@ impl Cluster {
         assert!(!self.replicas.is_empty());
 
         let total = self.replicas.len();
-
         let majority = quorum(total) + 1;
 
-        let mut views = HashMap::<usize, usize>::new();
+        let mut views = HashMap::<usize, usize>::with_capacity(total);
         for replica in &self.replicas {
             let count = views.entry(replica.view).or_default();
             *count += 1;

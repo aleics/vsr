@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use thiserror::Error;
 
@@ -10,8 +13,15 @@ use crate::{
     },
 };
 
+pub trait Service {
+    type Input;
+    type Output;
+
+    fn execute(&mut self, input: &Self::Input) -> Self::Output;
+}
+
 /// A single replica
-pub(crate) struct Replica {
+pub(crate) struct Replica<S: Clone + Service, I: Clone, O: Clone> {
     /// The current replica number given the configuration
     replica_number: usize,
 
@@ -29,7 +39,7 @@ pub(crate) struct Replica {
 
     /// Log entries of size "operation_number" containing the requests
     /// that have been received so far in their assigned order.
-    log: Log,
+    log: Log<I>,
 
     /// The operation number of the most recently committed operation
     commit_number: usize,
@@ -42,33 +52,44 @@ pub(crate) struct Replica {
 
     /// For each client, the number of its most recent request, plus,
     /// if the request has been executed, the result sent for that request.
-    client_table: HashMap<usize, ClientTableEntry>,
+    client_table: HashMap<usize, ClientTableEntry<O>>,
 
-    pub(crate) network: ReplicaNetwork,
+    service: RefCell<S>,
+
+    pub(crate) network: ReplicaNetwork<I, O>,
 }
 
-impl Replica {
-    pub(crate) fn new(replica_number: usize, total: usize, network: ReplicaNetwork) -> Self {
+impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Replica<S, I, O> {
+    pub(crate) fn new(
+        replica_number: usize,
+        total: usize,
+        service: S,
+        network: ReplicaNetwork<I, O>,
+    ) -> Self {
         Replica {
             replica_number,
             view: 0,
             total,
             status: ReplicaStatus::Normal,
             operation_number: 0,
-            log: Log::default(),
+            log: Log::new(),
             commit_number: 0,
             acks: HashMap::default(),
             client_table: HashMap::default(),
             network,
+            service: RefCell::new(service),
         }
     }
 
-    fn handle_message(&mut self, message: Message) -> Result<(), ReplicaError> {
-        println!(
-            "Received message {:?} in replica {}",
-            message, self.replica_number
-        );
+    fn handle_client_message(&mut self, message: ClientMessage<I>) -> Result<(), ReplicaError> {
+        let message = match message {
+            ClientMessage::Request(request) => Message::Request(request),
+        };
 
+        self.handle_message(message)
+    }
+
+    fn handle_message(&mut self, message: Message<I, O>) -> Result<(), ReplicaError> {
         match message {
             Message::Request(request) => self.handle_request(request),
             Message::Prepare(prepare) => self.handle_prepare(prepare),
@@ -80,7 +101,7 @@ impl Replica {
         }
     }
 
-    fn handle_request(&mut self, request: RequestMessage) -> Result<(), ReplicaError> {
+    fn handle_request(&mut self, request: RequestMessage<I>) -> Result<(), ReplicaError> {
         // Backup replicas ignore client request message.
         if self.replica_number != request.view {
             return Ok(());
@@ -95,11 +116,11 @@ impl Replica {
             }
 
             if most_recent_request.request_number == request.request_number {
-                if let Some(result) = most_recent_request.response {
+                if let Some(result) = most_recent_request.response.as_ref() {
                     let message = Message::Reply(ReplyMessage {
                         view: request.view,
                         request_number: most_recent_request.request_number,
-                        result,
+                        result: result.clone(),
                     });
                     return self.network.client.send_out(message, request.client_id);
                 }
@@ -108,8 +129,14 @@ impl Replica {
 
         // Advance the operation number adds the request to the end of the log, and updates the
         // information for this client in the client-table to contain the new request number
+        assert!(self.operation_number == self.log.size());
+
         self.operation_number += 1;
-        self.log.append(&request);
+        self.log.append(
+            request.operation.clone(),
+            request.request_number,
+            request.client_id,
+        );
         self.client_table.insert(
             request.client_id,
             ClientTableEntry {
@@ -129,7 +156,7 @@ impl Replica {
         self.network.broadcast(&message)
     }
 
-    fn handle_prepare(&mut self, prepare: PrepareMessage) -> Result<(), ReplicaError> {
+    fn handle_prepare(&mut self, prepare: PrepareMessage<I>) -> Result<(), ReplicaError> {
         // `Prepare` messages must only be received by backup replicas
         assert!(self.replica_number != prepare.view);
 
@@ -149,10 +176,16 @@ impl Replica {
 
         // Advance the operation number
         assert!(self.operation_number + 1 == prepare.operation_number);
+        assert!(self.operation_number == self.log.size());
+
         self.operation_number = prepare.operation_number;
 
         // Add the request to the end of the log
-        self.log.append(&prepare.request);
+        self.log.append(
+            prepare.request.operation.clone(),
+            prepare.request.request_number,
+            prepare.request.client_id,
+        );
 
         // Send a prepare ok message to the primary
         self.network.send(
@@ -192,7 +225,7 @@ impl Replica {
         };
 
         // Execute the query
-        let result = self.execute();
+        let result = self.execute(prepare_ok.operation_number);
 
         // Increment commit_number
         self.commit_number += 1;
@@ -206,7 +239,7 @@ impl Replica {
             Message::Reply(ReplyMessage {
                 view: prepare_ok.view,
                 request_number: request.request_number,
-                result,
+                result: result.clone(),
             }),
             prepare_ok.client_id,
         )?;
@@ -223,9 +256,14 @@ impl Replica {
         Ok(())
     }
 
-    fn execute(&self) -> () {
-        // TODO: here we run the service logic and build response
-        ()
+    fn execute(&self, operation_number: usize) -> O {
+        let operation = self
+            .log
+            .get_operation(operation_number)
+            .expect("Operation not found in log");
+
+        let mut service = self.service.borrow_mut();
+        service.execute(operation)
     }
 
     fn send_commit(&self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
@@ -242,14 +280,8 @@ impl Replica {
 
     pub(crate) fn tick(&mut self) {
         while !self.network.client.incoming.1.is_empty() {
-            let message = match self.network.client.incoming.1.recv().unwrap() {
-                ClientMessage::Request(request) => Message::Request(request),
-                ClientMessage::Response { .. } => {
-                    unreachable!("Replica should not receive a client response message")
-                }
-            };
-
-            self.handle_message(message).unwrap();
+            let message = self.network.client.incoming.1.recv().unwrap();
+            self.handle_client_message(message).unwrap();
         }
 
         while !self.network.incoming.is_empty() {
@@ -265,38 +297,53 @@ pub(crate) fn quorum(total: usize) -> usize {
     (total - 1) / 2
 }
 
-#[derive(Debug, Default)]
-struct Log {
+#[derive(Debug)]
+struct Log<I> {
     /// A queue of log entries for each request sent to the replica.
-    entries: VecDeque<LogEntry>,
+    entries: Vec<LogEntry<I>>,
 }
 
-impl Log {
+impl<I> Log<I> {
     fn new() -> Self {
-        Log::default()
+        Log {
+            entries: Vec::new(),
+        }
     }
 
-    fn append(&mut self, request: &RequestMessage) {
-        let entry = LogEntry {
-            request_number: request.request_number,
-            client_id: request.client_id,
-        };
-        self.entries.push_front(entry);
+    fn append(&mut self, operation: I, request_number: usize, client_id: usize) {
+        self.entries.push(LogEntry {
+            request_number,
+            client_id,
+            operation,
+        });
+    }
+
+    fn get_operation(&self, operation_number: usize) -> Option<&I> {
+        // The operation number is a 1-based counter. Thus, we need to subtract 1 to get
+        // the associated index
+        let index = operation_number - 1;
+        self.entries.get(index).map(|entry| &entry.operation)
+    }
+
+    fn size(&self) -> usize {
+        self.entries.len()
     }
 }
 
 #[derive(Debug)]
-struct LogEntry {
+struct LogEntry<T> {
     /// The request number of the log.
     request_number: usize,
     /// The client ID that triggered the request.
     client_id: usize,
+    /// Operation of the request
+    operation: T,
 }
 
 #[derive(Debug)]
-struct ClientTableEntry {
+struct ClientTableEntry<S> {
     request_number: usize,
-    response: Option<()>,
+    response: Option<S>,
 }
 
 enum ReplicaStatus {
