@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::{
     Message,
     network::{
-        CommitMessage, PrepareMessage, PrepareOkMessage, ReplicaNetwork, ReplyMessage,
-        RequestMessage,
+        CommitMessage, GetStateMessage, NewStateMessage, PrepareMessage, PrepareOkMessage,
+        ReplicaNetwork, ReplyMessage, RequestMessage,
     },
 };
 
@@ -104,6 +104,8 @@ where
             Message::Prepare(prepare) => self.handle_prepare(prepare),
             Message::PrepareOk(prepare_ok) => self.handle_prepare_ok(prepare_ok),
             Message::Commit(commit) => self.handle_commit(commit),
+            Message::GetState(get_state) => self.handle_get_state(get_state),
+            Message::NewState(new_state) => self.handle_new_state(new_state),
             Message::StartViewChange(start_view_change) => todo!(),
             Message::DoViewChange(do_view_change) => todo!(),
             Message::StartView(start_view) => todo!(),
@@ -114,6 +116,11 @@ where
         // Backup replicas ignore client request message.
         if !self.is_primary() {
             return Ok(());
+        }
+
+        // The replica and message should message
+        if self.view != request.view {
+            return Err(ReplicaError::MessageViewMismatch);
         }
 
         // The replica is not ready to receive calls, the client must wait.
@@ -172,6 +179,11 @@ where
         // `Prepare` messages must only be received by backup replicas
         assert!(!self.is_primary());
 
+        // The replica and message should message
+        if self.view != prepare.view {
+            return Err(ReplicaError::MessageViewMismatch);
+        }
+
         // Update the commit number from the primary committed in a previous request.
         self.commit_number = prepare.commit_number;
         self.committed_at = Instant::now();
@@ -183,8 +195,7 @@ where
 
         // Replica is missing some operations, we should initiate state transfer
         if self.operation_number + 1 < prepare.operation_number {
-            // TODO: implement state transfer protocol
-            return Ok(());
+            return self.trigger_state_transfer();
         }
 
         // Advance the operation number
@@ -215,6 +226,11 @@ where
     fn handle_prepare_ok(&mut self, prepare_ok: PrepareOkMessage) -> Result<(), ReplicaError> {
         // `PrepareOk` messages must only be received by the primary
         assert!(self.is_primary());
+
+        // The replica and message should message
+        if self.view != prepare_ok.view {
+            return Err(ReplicaError::MessageViewMismatch);
+        }
 
         // The primary waits for at least a quorum amount of `PrepareOk` messages
         // from different backups
@@ -278,7 +294,11 @@ where
 
         // `Commit` messages must only be received by backup replicas
         assert!(!self.is_primary());
-        assert!(self.view == commit.view);
+
+        // The replica and message should message
+        if self.view != commit.view {
+            return Err(ReplicaError::MessageViewMismatch);
+        }
 
         // If the replica has a higher or equal operation number, the operation
         // was already commited. We'll update our latest commit operation but nothing
@@ -290,7 +310,7 @@ where
 
         let has_log = self.log.get_operation(commit.operation_number).is_some();
         if !has_log {
-            todo!("Implement state transfer")
+            return self.trigger_state_transfer();
         }
 
         // Execute earlier and current operation by checking the log after state
@@ -305,6 +325,45 @@ where
         }
 
         self.commit_number = commit.operation_number;
+        self.committed_at = Instant::now();
+
+        Ok(())
+    }
+
+    fn trigger_state_transfer(&self) -> Result<(), ReplicaError> {
+        let message = Message::GetState(GetStateMessage {
+            view: self.view,
+            operation_number: self.operation_number,
+            replica_number: self.replica_number,
+        });
+
+        // Send message to the next replica in the circle
+        let next_replica = (self.replica_number + 1) % self.total;
+        self.network.send(message, &next_replica)
+    }
+
+    fn handle_get_state(&mut self, get_state: GetStateMessage) -> Result<(), ReplicaError> {
+        assert!(self.status == ReplicaStatus::Normal);
+        assert!(self.view == get_state.view);
+
+        let log_after_operation = self.log.since(get_state.operation_number);
+
+        let message = Message::NewState(NewStateMessage {
+            view: self.view,
+            log_after_operation,
+            operation_number: self.operation_number,
+            commit_number: self.commit_number,
+        });
+
+        self.network.send(message, &get_state.replica_number)
+    }
+
+    fn handle_new_state(&mut self, new_state: NewStateMessage<I>) -> Result<(), ReplicaError> {
+        assert!(self.view == new_state.view);
+
+        self.log.merge(new_state.log_after_operation);
+        self.operation_number = new_state.operation_number;
+        self.commit_number = new_state.commit_number;
         self.committed_at = Instant::now();
 
         Ok(())
@@ -393,6 +452,30 @@ where
             .map(|entry| &entry.operation)
     }
 
+    fn since(&self, operation_number: usize) -> Log<I> {
+        if self.entries.len() >= operation_number {
+            return Log::new();
+        }
+
+        let mut entries = Vec::new();
+        for i in operation_number..self.entries.len() {
+            let entry = self
+                .entries
+                .get(i)
+                .expect("Log entry must be inside boundaries");
+
+            entries.push(entry.clone());
+        }
+
+        Log { entries }
+    }
+
+    fn merge(&mut self, log: Log<I>) {
+        for entry in log.entries {
+            self.entries.push(entry)
+        }
+    }
+
     fn size(&self) -> usize {
         self.entries.len()
     }
@@ -434,4 +517,6 @@ pub enum ReplicaError {
     NotReady,
     #[error("A replica has an invalid state")]
     InvalidState,
+    #[error("View mismatch between client and replica")]
+    MessageViewMismatch,
 }

@@ -10,6 +10,8 @@ pub(crate) enum Message<I> {
     Prepare(PrepareMessage<I>),
     PrepareOk(PrepareOkMessage),
     Commit(CommitMessage),
+    GetState(GetStateMessage),
+    NewState(NewStateMessage<I>),
     StartViewChange(StartViewChangeMessage),
     DoViewChange(DoViewChangeMessage<I>),
     StartView(StartViewMessage<I>),
@@ -43,6 +45,21 @@ pub(crate) struct PrepareOkMessage {
 pub(crate) struct CommitMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GetStateMessage {
+    pub(crate) view: usize,
+    pub(crate) operation_number: usize,
+    pub(crate) replica_number: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NewStateMessage<I> {
+    pub(crate) view: usize,
+    pub(crate) log_after_operation: Log<I>,
+    pub(crate) operation_number: usize,
+    pub(crate) commit_number: usize,
 }
 
 #[derive(Debug, Clone)]
