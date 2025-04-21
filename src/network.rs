@@ -173,7 +173,7 @@ where
         sender.send(message).map_err(|_| ReplicaError::NetworkError)
     }
 
-    pub(crate) fn broadcast(&self, message: &Message<I>) -> Result<(), ReplicaError> {
+    pub(crate) fn broadcast(&self, message: Message<I>) -> Result<(), ReplicaError> {
         for sender in self.other.values() {
             sender
                 .send(message.clone())

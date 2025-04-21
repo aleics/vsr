@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
-use crossbeam::select;
+use crossbeam::{channel::tick, select};
 use thiserror::Error;
 
 use crate::{
@@ -20,6 +21,9 @@ pub trait Service {
 
     fn execute(&self, input: &Self::Input) -> Self::Output;
 }
+
+const PERIODIC_INTERVAL: Duration = Duration::from_millis(20);
+const COMMIT_TIMEOUT_MS: Duration = Duration::from_millis(200);
 
 /// A single replica
 pub struct Replica<S, I, O> {
@@ -38,6 +42,12 @@ pub struct Replica<S, I, O> {
     /// Most recently received request, initially 0
     operation_number: usize,
 
+    /// Acknowledgements table with the operations that have been acknowledged by
+    /// a given amount of replicas.
+    /// Key is the operation number, value is the replica numbers that acknowledged
+    /// this operation.
+    acks: HashMap<usize, Ack>,
+
     /// Log entries of size "operation_number" containing the requests
     /// that have been received so far in their assigned order.
     log: Log<I>,
@@ -45,18 +55,18 @@ pub struct Replica<S, I, O> {
     /// The operation number of the most recently committed operation
     commit_number: usize,
 
-    /// Acknowledgements table with the operations that have been acknowledged by
-    /// a given amount of replicas.
-    /// Key is the operation number, value is the replica numbers that acknowledged
-    /// this operation.
-    acks: HashMap<usize, Ack>,
+    /// The timestamp of the last committed operation.
+    committed_at: Instant,
 
     /// For each client, the number of its most recent request, plus,
     /// if the request has been executed, the result sent for that request.
     client_table: HashMap<usize, ClientTableEntry<O>>,
 
+    /// Service container used by the replica to execute client requests.
     service: Arc<S>,
 
+    /// Network of the replica containing connections to all the replicas
+    /// and the client
     pub(crate) network: ReplicaNetwork<I, O>,
 }
 
@@ -80,6 +90,7 @@ where
             operation_number: 0,
             log: Log::new(),
             commit_number: 0,
+            committed_at: Instant::now(),
             acks: HashMap::default(),
             client_table: HashMap::default(),
             network,
@@ -101,7 +112,7 @@ where
 
     fn handle_request(&mut self, request: RequestMessage<I>) -> Result<(), ReplicaError> {
         // Backup replicas ignore client request message.
-        if self.replica_number != request.view {
+        if !self.is_primary() {
             return Ok(());
         }
 
@@ -149,22 +160,21 @@ where
         );
 
         // Broadcast message to the backup replicas
-        let message = Message::Prepare(PrepareMessage {
+        self.network.broadcast(Message::Prepare(PrepareMessage {
             view: request.view,
             operation_number: self.operation_number,
             commit_number: self.commit_number,
             request,
-        });
-
-        self.network.broadcast(&message)
+        }))
     }
 
     fn handle_prepare(&mut self, prepare: PrepareMessage<I>) -> Result<(), ReplicaError> {
         // `Prepare` messages must only be received by backup replicas
-        assert!(self.replica_number != prepare.view);
+        assert!(!self.is_primary());
 
         // Update the commit number from the primary committed in a previous request.
         self.commit_number = prepare.commit_number;
+        self.committed_at = Instant::now();
 
         // The operation has already been processed by the replica. The message is duplicate and will be ignored.
         if self.operation_number + 1 > prepare.operation_number {
@@ -204,7 +214,7 @@ where
 
     fn handle_prepare_ok(&mut self, prepare_ok: PrepareOkMessage) -> Result<(), ReplicaError> {
         // `PrepareOk` messages must only be received by the primary
-        assert!(self.replica_number == prepare_ok.view);
+        assert!(self.is_primary());
 
         // The primary waits for at least a quorum amount of `PrepareOk` messages
         // from different backups
@@ -228,10 +238,17 @@ where
         };
 
         // Execute the query
-        let result = self.execute(prepare_ok.operation_number);
+        let operation = self
+            .log
+            .get_operation(prepare_ok.operation_number)
+            .expect("Operation not found in log");
+
+        let result = self.service.execute(operation);
 
         // Increment commit_number
         self.commit_number += 1;
+        self.committed_at = Instant::now();
+
         self.acks.insert(prepare_ok.operation_number, Ack::Executed);
 
         let request = self.client_table.get_mut(&prepare_ok.client_id)
@@ -253,34 +270,75 @@ where
         Ok(())
     }
 
-    fn handle_commit(&mut self, message: CommitMessage) -> Result<(), ReplicaError> {
-        self.commit_number = message.operation_number;
+    fn handle_commit(&mut self, commit: CommitMessage) -> Result<(), ReplicaError> {
+        // Replica is not prepared to handle operations, the commit message is ignored.
+        if self.status != ReplicaStatus::Normal {
+            return Ok(());
+        }
+
+        // `Commit` messages must only be received by backup replicas
+        assert!(!self.is_primary());
+        assert!(self.view == commit.view);
+
+        // If the replica has a higher or equal operation number, the operation
+        // was already commited. We'll update our latest commit operation but nothing
+        // to execute.
+        if self.commit_number >= commit.operation_number {
+            self.committed_at = Instant::now();
+            return Ok(());
+        }
+
+        let has_log = self.log.get_operation(commit.operation_number).is_some();
+        if !has_log {
+            todo!("Implement state transfer")
+        }
+
+        // Execute earlier and current operation by checking the log after state
+        // transfer was successful
+        for operation_number in self.operation_number..=commit.operation_number {
+            let Some(operation) = self.log.get_operation(operation_number) else {
+                // Log state is incorrect. Intermediate operations are missing
+                return Err(ReplicaError::InvalidState);
+            };
+
+            self.service.execute(operation);
+        }
+
+        self.commit_number = commit.operation_number;
+        self.committed_at = Instant::now();
 
         Ok(())
     }
 
-    fn execute(&self, operation_number: usize) -> O {
-        let operation = self
-            .log
-            .get_operation(operation_number)
-            .expect("Operation not found in log");
+    fn periodic(&self) -> Result<(), ReplicaError> {
+        // Primary periodic tasks
+        if self.is_primary() {
+            // If the last committed was sent
+            if self.committed_at.elapsed() >= COMMIT_TIMEOUT_MS {
+                self.send_commit(self.view, self.operation_number)?;
+            }
+        }
 
-        self.service.execute(operation)
+        Ok(())
     }
 
     fn send_commit(&self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
         // `Commit` messages must only be received by the primary
         assert!(self.replica_number == view);
 
-        let message = Message::Commit(CommitMessage {
+        self.network.broadcast(Message::Commit(CommitMessage {
             view,
             operation_number,
-        });
+        }))
+    }
 
-        self.network.broadcast(&message)
+    fn is_primary(&self) -> bool {
+        self.view == self.replica_number
     }
 
     pub fn run(mut self) {
+        let ticker = tick(PERIODIC_INTERVAL);
+
         loop {
             select! {
                 recv(self.network.client.incoming.1) -> message => match message {
@@ -290,7 +348,8 @@ where
                 recv(self.network.incoming) -> message => match message {
                     Ok(message) => self.handle_message(message).unwrap(),
                     Err(_) => panic!("something went wrong")
-                }
+                },
+                recv(ticker) -> _ => self.periodic().unwrap()
             }
         }
     }
@@ -329,8 +388,9 @@ where
     fn get_operation(&self, operation_number: usize) -> Option<&I> {
         // The operation number is a 1-based counter. Thus, we need to subtract 1 to get
         // the associated index
-        let index = operation_number - 1;
-        self.entries.get(index).map(|entry| &entry.operation)
+        self.entries
+            .get(operation_number - 1)
+            .map(|entry| &entry.operation)
     }
 
     fn size(&self) -> usize {
@@ -372,4 +432,6 @@ pub enum ReplicaError {
     NetworkError,
     #[error("A replica is not ready to receive requests")]
     NotReady,
+    #[error("A replica has an invalid state")]
+    InvalidState,
 }
