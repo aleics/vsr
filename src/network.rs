@@ -2,15 +2,18 @@ use std::collections::HashMap;
 
 use crossbeam::channel::{Receiver, Sender, unbounded};
 
-use crate::replica::ReplicaError;
+use crate::replica::{Log, ReplicaError};
 
 #[derive(Debug, Clone)]
-pub(crate) enum Message<I: Clone, O: Clone> {
+pub(crate) enum Message<I: Clone + Send, O: Clone + Send> {
     Request(RequestMessage<I>),
     Prepare(PrepareMessage<I>),
     PrepareOk(PrepareOkMessage),
     Commit(CommitMessage),
     Reply(ReplyMessage<O>),
+    StartViewChange(StartViewChangeMessage),
+    DoViewChange(DoViewChangeMessage<I>),
+    StartView(StartViewMessage<I>),
 }
 
 #[derive(Debug, Clone)]
@@ -51,17 +54,41 @@ pub(crate) struct ReplyMessage<O> {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct StartViewChangeMessage {
+    pub(crate) new_view: usize,
+    pub(crate) replica_number: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DoViewChangeMessage<I: Clone> {
+    pub(crate) old_view: usize,
+    pub(crate) new_view: usize,
+    pub(crate) log: Log<I>,
+    pub(crate) operation_number: usize,
+    pub(crate) commit_number: usize,
+    pub(crate) replica_number: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StartViewMessage<I: Clone> {
+    pub(crate) view: usize,
+    pub(crate) log: Log<I>,
+    pub(crate) operation_number: usize,
+    pub(crate) commit_number: usize,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum ClientMessage<I: Clone> {
     Request(RequestMessage<I>),
 }
 
-pub(crate) struct AttachedChannel<I: Clone, O: Clone> {
+pub(crate) struct AttachedChannel<I: Clone + Send, O: Clone + Send> {
     pub(crate) client_id: usize,
     pub(crate) channel: (Sender<ClientMessage<I>>, Receiver<Message<I, O>>),
 }
 
 #[derive(Clone)]
-pub(crate) struct ClientConnection<I: Clone, O: Clone> {
+pub(crate) struct ClientConnection<I: Clone + Send, O: Clone + Send> {
     /// Incoming messages from the client to the replica. The sender is used by the client to connect to the replica.
     /// The receiver is used to receive messages from the client
     pub(crate) incoming: (Sender<ClientMessage<I>>, Receiver<ClientMessage<I>>),
@@ -70,7 +97,7 @@ pub(crate) struct ClientConnection<I: Clone, O: Clone> {
     pub(crate) outgoing: Vec<Sender<Message<I, O>>>,
 }
 
-impl<I: Clone, O: Clone> ClientConnection<I, O> {
+impl<I: Clone + Send, O: Clone + Send> ClientConnection<I, O> {
     pub(crate) fn new() -> Self {
         ClientConnection {
             incoming: unbounded(),
@@ -103,7 +130,7 @@ impl<I: Clone, O: Clone> ClientConnection<I, O> {
     }
 }
 
-pub(crate) struct ReplicaNetwork<I: Clone, O: Clone> {
+pub(crate) struct ReplicaNetwork<I: Clone + Send, O: Clone + Send> {
     pub(crate) client: ClientConnection<I, O>,
     pub(crate) incoming: Receiver<Message<I, O>>,
     pub(crate) other: HashMap<usize, Sender<Message<I, O>>>,
@@ -111,7 +138,7 @@ pub(crate) struct ReplicaNetwork<I: Clone, O: Clone> {
 
 pub(crate) type MessageChannel<I, O> = (Sender<Message<I, O>>, Receiver<Message<I, O>>);
 
-impl<I: Clone, O: Clone> ReplicaNetwork<I, O> {
+impl<I: Clone + Send, O: Clone + Send> ReplicaNetwork<I, O> {
     pub(crate) fn for_replica(
         replica: usize,
         client: ClientConnection<I, O>,

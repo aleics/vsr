@@ -58,12 +58,13 @@ pub struct Config {
     pub addresses: Vec<String>,
 }
 
-pub struct Cluster<S: Clone + Service, I: Clone, O: Clone> {
-    replicas: Vec<Replica<S, I, O>>,
-}
+pub struct Cluster;
 
-impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Cluster<S, I, O> {
-    pub fn new(config: &Config, service: S) -> Self {
+impl Cluster {
+    pub fn create<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send>(
+        config: &Config,
+        service: S,
+    ) -> Vec<Replica<S, I, O>> {
         let total = config.addresses.len();
 
         let mut channels = Vec::with_capacity(total);
@@ -71,41 +72,44 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Cluster<S, I
             channels.push(unbounded::<Message<I, O>>())
         }
 
-        let client = ClientConnection::new();
-
         let mut replicas = Vec::with_capacity(total);
         for (i, _) in config.addresses.iter().enumerate() {
             replicas.push(Replica::new(
                 i,
                 total,
                 service.clone(),
-                ReplicaNetwork::for_replica(i, client.clone(), &channels),
+                ReplicaNetwork::for_replica(i, ClientConnection::new(), &channels),
             ));
         }
 
-        Cluster { replicas }
+        replicas
     }
 
-    pub fn handshake(&mut self) -> Client<I, O> {
-        let primary = self.primary();
+    pub fn handshake<
+        S: Clone + Service<Input = I, Output = O>,
+        I: Clone + Send,
+        O: Clone + Send,
+    >(
+        replicas: &mut Vec<Replica<S, I, O>>,
+    ) -> Client<I, O> {
+        let primary = Self::primary(replicas);
 
-        let replica = self
-            .replicas
-            .get_mut(primary)
-            .expect("Primary index not valid");
+        let replica = replicas.get_mut(primary).expect("Primary index not valid");
 
         let AttachedChannel { client_id, channel } = replica.network.client.attach();
         Client::new(client_id, replica.view, channel)
     }
 
-    fn primary(&self) -> usize {
-        assert!(!self.replicas.is_empty());
+    fn primary<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send>(
+        replicas: &Vec<Replica<S, I, O>>,
+    ) -> usize {
+        assert!(!replicas.is_empty());
 
-        let total = self.replicas.len();
+        let total = replicas.len();
         let majority = quorum(total) + 1;
 
         let mut views = HashMap::<usize, usize>::with_capacity(total);
-        for replica in &self.replicas {
+        for replica in replicas {
             let count = views.entry(replica.view).or_default();
             *count += 1;
         }
@@ -117,11 +121,5 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Cluster<S, I
         }
 
         panic!("Primary could not be found")
-    }
-
-    pub fn tick(&mut self) {
-        for replica in &mut self.replicas {
-            replica.tick();
-        }
     }
 }

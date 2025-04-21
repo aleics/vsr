@@ -9,7 +9,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct Client<I: Clone, O: Clone> {
+pub struct Client<I: Clone + Send, O: Clone + Send> {
     /// Client identification
     client_id: usize,
 
@@ -23,7 +23,7 @@ pub struct Client<I: Clone, O: Clone> {
     channel: (Sender<ClientMessage<I>>, Receiver<Message<I, O>>),
 }
 
-impl<I: Clone, O: Clone> Client<I, O> {
+impl<I: Clone + Send, O: Clone + Send> Client<I, O> {
     pub(crate) fn new(
         client_id: usize,
         view: usize,

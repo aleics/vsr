@@ -1,8 +1,9 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
+use crossbeam::select;
 use thiserror::Error;
 
 use crate::{
@@ -17,11 +18,11 @@ pub trait Service {
     type Input;
     type Output;
 
-    fn execute(&mut self, input: &Self::Input) -> Self::Output;
+    fn execute(&self, input: &Self::Input) -> Self::Output;
 }
 
 /// A single replica
-pub(crate) struct Replica<S: Clone + Service, I: Clone, O: Clone> {
+pub struct Replica<S: Clone + Service, I: Clone + Send, O: Clone + Send> {
     /// The current replica number given the configuration
     replica_number: usize,
 
@@ -54,12 +55,12 @@ pub(crate) struct Replica<S: Clone + Service, I: Clone, O: Clone> {
     /// if the request has been executed, the result sent for that request.
     client_table: HashMap<usize, ClientTableEntry<O>>,
 
-    service: RefCell<S>,
+    service: Arc<S>,
 
     pub(crate) network: ReplicaNetwork<I, O>,
 }
 
-impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Replica<S, I, O> {
+impl<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send> Replica<S, I, O> {
     pub(crate) fn new(
         replica_number: usize,
         total: usize,
@@ -77,7 +78,7 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Replica<S, I
             acks: HashMap::default(),
             client_table: HashMap::default(),
             network,
-            service: RefCell::new(service),
+            service: Arc::new(service),
         }
     }
 
@@ -98,6 +99,9 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Replica<S, I
             Message::Reply { .. } => {
                 unreachable!("Reply messages should be sent to the client")
             }
+            Message::StartViewChange(start_view_change) => todo!(),
+            Message::DoViewChange(do_view_change) => todo!(),
+            Message::StartView(start_view) => todo!(),
         }
     }
 
@@ -105,6 +109,11 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Replica<S, I
         // Backup replicas ignore client request message.
         if self.replica_number != request.view {
             return Ok(());
+        }
+
+        // The replica is not ready to receive calls, the client must wait.
+        if self.status != ReplicaStatus::Normal {
+            return Err(ReplicaError::NotReady);
         }
 
         // If the request-number isn’t bigger than the information in the client table it drops the
@@ -262,8 +271,7 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Replica<S, I
             .get_operation(operation_number)
             .expect("Operation not found in log");
 
-        let mut service = self.service.borrow_mut();
-        service.execute(operation)
+        self.service.execute(operation)
     }
 
     fn send_commit(&self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
@@ -278,15 +286,18 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone, O: Clone> Replica<S, I
         self.network.broadcast(&message)
     }
 
-    pub(crate) fn tick(&mut self) {
-        while !self.network.client.incoming.1.is_empty() {
-            let message = self.network.client.incoming.1.recv().unwrap();
-            self.handle_client_message(message).unwrap();
-        }
-
-        while !self.network.incoming.is_empty() {
-            let message = self.network.incoming.recv().unwrap();
-            self.handle_message(message).unwrap();
+    pub fn run(mut self) {
+        loop {
+            select! {
+                recv(self.network.client.incoming.1) -> message => match message {
+                    Ok(message) => self.handle_client_message(message).unwrap(),
+                    Err(_) => panic!("something went wrong")
+                },
+                recv(self.network.incoming) -> message => match message {
+                    Ok(message) => self.handle_message(message).unwrap(),
+                    Err(_) => panic!("something went wrong")
+                }
+            }
         }
     }
 }
@@ -297,13 +308,13 @@ pub(crate) fn quorum(total: usize) -> usize {
     (total - 1) / 2
 }
 
-#[derive(Debug)]
-struct Log<I> {
+#[derive(Debug, Clone)]
+pub(crate) struct Log<I: Clone> {
     /// A queue of log entries for each request sent to the replica.
     entries: Vec<LogEntry<I>>,
 }
 
-impl<I> Log<I> {
+impl<I: Clone> Log<I> {
     fn new() -> Self {
         Log {
             entries: Vec::new(),
@@ -330,8 +341,8 @@ impl<I> Log<I> {
     }
 }
 
-#[derive(Debug)]
-struct LogEntry<T> {
+#[derive(Debug, Clone)]
+struct LogEntry<T: Clone> {
     /// The request number of the log.
     request_number: usize,
     /// The client ID that triggered the request.
@@ -346,6 +357,7 @@ struct ClientTableEntry<S> {
     response: Option<S>,
 }
 
+#[derive(Debug, PartialEq)]
 enum ReplicaStatus {
     Normal,
     ViewChange,
@@ -361,4 +373,6 @@ enum Ack {
 pub enum ReplicaError {
     #[error("A message could not be sent or received")]
     NetworkError,
+    #[error("A replica is not ready to receive requests")]
+    NotReady,
 }
