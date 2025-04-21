@@ -1,6 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -10,8 +10,9 @@ use thiserror::Error;
 use crate::{
     Message,
     network::{
-        CommitMessage, GetStateMessage, NewStateMessage, PrepareMessage, PrepareOkMessage,
-        ReplicaNetwork, ReplyMessage, RequestMessage,
+        CommitMessage, DoViewChangeMessage, GetStateMessage, NewStateMessage, PrepareMessage,
+        PrepareOkMessage, ReplicaNetwork, ReplyMessage, RequestMessage, StartViewChangeMessage,
+        StartViewMessage,
     },
 };
 
@@ -24,6 +25,7 @@ pub trait Service {
 
 const PERIODIC_INTERVAL: Duration = Duration::from_millis(20);
 const COMMIT_TIMEOUT_MS: Duration = Duration::from_millis(200);
+const IDLE_TIMEOUT_MS: Duration = Duration::from_millis(2000);
 
 /// A single replica
 pub struct Replica<S, I, O> {
@@ -43,10 +45,12 @@ pub struct Replica<S, I, O> {
     operation_number: usize,
 
     /// Acknowledgements table with the operations that have been acknowledged by
-    /// a given amount of replicas.
+    /// a given amount of replicas for a client request.
     /// Key is the operation number, value is the replica numbers that acknowledged
     /// this operation.
-    acks: HashMap<usize, Ack>,
+    prepare_acks: HashMap<usize, PrepareAck>,
+
+    view_acks: BinaryHeap<ViewAck<I>>,
 
     /// Log entries of size "operation_number" containing the requests
     /// that have been received so far in their assigned order.
@@ -63,7 +67,7 @@ pub struct Replica<S, I, O> {
     client_table: HashMap<usize, ClientTableEntry<O>>,
 
     /// Service container used by the replica to execute client requests.
-    service: Arc<S>,
+    service: S,
 
     /// Network of the replica containing connections to all the replicas
     /// and the client
@@ -91,10 +95,11 @@ where
             log: Log::new(),
             commit_number: 0,
             committed_at: Instant::now(),
-            acks: HashMap::default(),
+            prepare_acks: HashMap::default(),
+            view_acks: BinaryHeap::new(),
             client_table: HashMap::default(),
             network,
-            service: Arc::new(service),
+            service,
         }
     }
 
@@ -106,9 +111,11 @@ where
             Message::Commit(commit) => self.handle_commit(commit),
             Message::GetState(get_state) => self.handle_get_state(get_state),
             Message::NewState(new_state) => self.handle_new_state(new_state),
-            Message::StartViewChange(start_view_change) => todo!(),
-            Message::DoViewChange(do_view_change) => todo!(),
-            Message::StartView(start_view) => todo!(),
+            Message::StartViewChange(start_view_change) => {
+                self.handle_start_view_change(start_view_change)
+            }
+            Message::DoViewChange(do_view_change) => self.handle_do_view_change(do_view_change),
+            Message::StartView(start_view) => self.handle_start_view(start_view),
         }
     }
 
@@ -184,10 +191,6 @@ where
             return Err(ReplicaError::MessageViewMismatch);
         }
 
-        // Update the commit number from the primary committed in a previous request.
-        self.commit_number = prepare.commit_number;
-        self.committed_at = Instant::now();
-
         // The operation has already been processed by the replica. The message is duplicate and will be ignored.
         if self.operation_number + 1 > prepare.operation_number {
             return Ok(());
@@ -198,18 +201,36 @@ where
             return self.trigger_state_transfer();
         }
 
-        // Advance the operation number
+        // Advance the operation number, update the log and the client table
         assert!(self.operation_number + 1 == prepare.operation_number);
         assert!(self.operation_number == self.log.size());
 
         self.operation_number = prepare.operation_number;
-
-        // Add the request to the end of the log
         self.log.append(
             prepare.request.operation.clone(),
             prepare.request.request_number,
             prepare.request.client_id,
         );
+        self.client_table.insert(
+            prepare.request.client_id,
+            ClientTableEntry {
+                request_number: prepare.request.request_number,
+                response: None,
+            },
+        );
+
+        // Execute previous committed operations by checking the log
+        for commit_number in self.commit_number..prepare.commit_number {
+            let Some(operation) = self.log.get_operation(commit_number + 1) else {
+                // Log state is incorrect. Intermediate operations are missing
+                return Err(ReplicaError::InvalidState);
+            };
+
+            self.service.execute(operation);
+        }
+
+        self.commit_number = prepare.commit_number;
+        self.committed_at = Instant::now();
 
         // Send a prepare ok message to the primary
         self.network.send(
@@ -235,15 +256,15 @@ where
         // The primary waits for at least a quorum amount of `PrepareOk` messages
         // from different backups
         let ack = self
-            .acks
+            .prepare_acks
             .entry(prepare_ok.operation_number)
-            .or_insert(Ack::Waiting {
+            .or_insert(PrepareAck::Waiting {
                 replicas: HashSet::with_capacity(self.total),
             });
 
         let ack_replicas = match ack {
-            Ack::Waiting { replicas } => replicas,
-            Ack::Executed => return Ok(()),
+            PrepareAck::Waiting { replicas } => replicas,
+            PrepareAck::Executed => return Ok(()),
         };
 
         ack_replicas.insert(prepare_ok.replica_number);
@@ -265,23 +286,24 @@ where
         self.commit_number += 1;
         self.committed_at = Instant::now();
 
-        self.acks.insert(prepare_ok.operation_number, Ack::Executed);
+        self.prepare_acks
+            .insert(prepare_ok.operation_number, PrepareAck::Executed);
 
-        let request = self.client_table.get_mut(&prepare_ok.client_id)
+        let client_request = self.client_table.get_mut(&prepare_ok.client_id)
             .expect("Client must be present in the client table since the request message has been already received");
 
         // Send reply message to the client
         self.network.client.send_out(
             ReplyMessage {
                 view: prepare_ok.view,
-                request_number: request.request_number,
+                request_number: client_request.request_number,
                 result: result.clone(),
             },
             prepare_ok.client_id,
         )?;
 
         // The primary also updates the client's entry in the client-table to contain the result
-        request.response = Some(result);
+        client_request.response = Some(result);
 
         Ok(())
     }
@@ -313,10 +335,9 @@ where
             return self.trigger_state_transfer();
         }
 
-        // Execute earlier and current operation by checking the log after state
-        // transfer was successful
-        for operation_number in self.operation_number..=commit.operation_number {
-            let Some(operation) = self.log.get_operation(operation_number) else {
+        // Execute previous committed operations by checking the log
+        for commit_number in self.commit_number..commit.operation_number {
+            let Some(operation) = self.log.get_operation(commit_number + 1) else {
                 // Log state is incorrect. Intermediate operations are missing
                 return Err(ReplicaError::InvalidState);
             };
@@ -338,7 +359,7 @@ where
         });
 
         // Send message to the next replica in the circle
-        let next_replica = (self.replica_number + 1) % self.total;
+        let next_replica = self.next_replica(self.replica_number);
         self.network.send(message, &next_replica)
     }
 
@@ -369,19 +390,196 @@ where
         Ok(())
     }
 
-    fn periodic(&self) -> Result<(), ReplicaError> {
+    fn handle_start_view_change(
+        &mut self,
+        start_view_change: StartViewChangeMessage,
+    ) -> Result<(), ReplicaError> {
+        let old_view = self.view;
+
+        // New backup replica acknowledges a view change and waits for the new primary
+        // to send a `StartView` message
+        if self.view != start_view_change.new_view {
+            self.view = start_view_change.new_view;
+            self.status = ReplicaStatus::ViewChange;
+        }
+
+        // The current primary won't send a `DoViewChange` message to itself.
+        // It will acknowledge the view change and wait for `DoViewChange` messages.
+        if self.is_primary() {
+            self.view_acks.push(ViewAck {
+                old_view,
+                operation_number: self.operation_number,
+                commit_number: self.commit_number,
+                log: self.log.clone(),
+            });
+            return Ok(());
+        }
+
+        // Send a `DoViewChange` to the new primary replica to mark the current replica
+        // ready for a view change.
+        let message = Message::DoViewChange(DoViewChangeMessage {
+            old_view,
+            new_view: self.view,
+            log: self.log.clone(),
+            operation_number: self.operation_number,
+            commit_number: self.commit_number,
+            replica_number: self.replica_number,
+        });
+
+        self.network.send(message, &self.view)
+    }
+
+    fn handle_do_view_change(
+        &mut self,
+        do_view_change: DoViewChangeMessage<I>,
+    ) -> Result<(), ReplicaError> {
+        // When the primary received `quorum + 1` `DoViewChange` messages from different replicas
+        // (including itself), it sets its view number to that in the messages as selects as the
+        // new log the one contained in the message with the largest view.
+
+        if self.view_acks.len() < quorum(self.total) {
+            self.view_acks.push(ViewAck {
+                old_view: do_view_change.old_view,
+                operation_number: do_view_change.operation_number,
+                commit_number: do_view_change.commit_number,
+                log: do_view_change.log,
+            });
+
+            return Ok(());
+        }
+
+        if self.view != do_view_change.new_view {
+            self.view = do_view_change.new_view;
+            self.status = ReplicaStatus::ViewChange;
+        }
+
+        let new_view =
+            self.view_acks.drain().next().expect(
+                "View acknowledgements are more than the quorum. At least 1 entry is present.",
+            );
+
+        let message = Message::StartView(StartViewMessage {
+            view: self.view,
+            log: new_view.log.clone(),
+            operation_number: self.operation_number,
+            commit_number: self.commit_number,
+        });
+
+        self.network.broadcast(message)?;
+
+        self.status = ReplicaStatus::Normal;
+
+        self.log = new_view.log;
+        self.operation_number = new_view.operation_number;
+
+        // In case any uncommitted operations are present
+        if self.operation_number > self.commit_number {
+            let mut executed_requests = HashMap::new();
+
+            // Iterate over all the uncommitted operations in the log in order
+            for operation_number in new_view.commit_number..=self.operation_number {
+                let log_entry = self.log.get_entry(operation_number).expect(
+                    "Log entry must be present if the operation number is higher than the log size",
+                );
+
+                // Execute the operation and send reply to the client
+                let result = self.service.execute(&log_entry.operation);
+
+                self.network.client.send_out(
+                    ReplyMessage {
+                        view: self.view,
+                        request_number: log_entry.request_number,
+                        result: result.clone(),
+                    },
+                    log_entry.client_id,
+                )?;
+
+                executed_requests.insert(
+                    log_entry.client_id,
+                    ClientTableEntry {
+                        request_number: log_entry.request_number,
+                        response: Some(result),
+                    },
+                );
+            }
+
+            // Update client table with the executed requests
+            self.client_table.extend(executed_requests);
+        }
+
+        self.commit_number = new_view.commit_number;
+        self.committed_at = Instant::now();
+
+        self.view_acks.clear();
+
+        Ok(())
+    }
+
+    fn handle_start_view(&mut self, start_view: StartViewMessage<I>) -> Result<(), ReplicaError> {
+        // Refresh internal state with the new view
+        self.status = ReplicaStatus::Normal;
+        self.log = start_view.log;
+        self.operation_number = start_view.operation_number;
+        self.view = start_view.view;
+
+        // Iterate over all the uncommitted operations in the log in order
+        if self.operation_number > self.commit_number {
+            let mut executed_requests = HashMap::new();
+            for operation_number in start_view.commit_number..=self.operation_number {
+                let log_entry = self.log.get_entry(operation_number).expect(
+                    "Log entry must be present if the operation number is higher than the log size",
+                );
+
+                // Execute the operation and send a `PrepareOk` to the new primary
+                let result = self.service.execute(&log_entry.operation);
+
+                self.network.send(
+                    Message::PrepareOk(PrepareOkMessage {
+                        view: self.view,
+                        operation_number,
+                        replica_number: self.replica_number,
+                        client_id: log_entry.client_id,
+                    }),
+                    &self.view,
+                )?;
+
+                executed_requests.insert(
+                    log_entry.client_id,
+                    ClientTableEntry {
+                        request_number: log_entry.request_number,
+                        response: Some(result),
+                    },
+                );
+            }
+
+            // Update client table with the executed requests
+            self.client_table.extend(executed_requests);
+        }
+
+        self.commit_number = start_view.commit_number;
+        self.committed_at = Instant::now();
+
+        Ok(())
+    }
+
+    fn periodic(&mut self) -> Result<(), ReplicaError> {
         // Primary periodic tasks
         if self.is_primary() {
-            // If the last committed was sent
+            // If the primary is idle (no requests sent)
             if self.committed_at.elapsed() >= COMMIT_TIMEOUT_MS {
-                self.send_commit(self.view, self.operation_number)?;
+                self.trigger_commit(self.view, self.operation_number)?;
+            }
+        } else {
+            // If the backup is idle (no requests received)
+            if self.committed_at.elapsed() >= IDLE_TIMEOUT_MS {
+                self.trigger_view_change()?;
             }
         }
 
         Ok(())
     }
 
-    fn send_commit(&self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
+    fn trigger_commit(&self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
         // `Commit` messages must only be received by the primary
         assert!(self.replica_number == view);
 
@@ -391,8 +589,30 @@ where
         }))
     }
 
+    fn trigger_view_change(&mut self) -> Result<(), ReplicaError> {
+        // If the replica is not running a view change already, or it's in recovery
+        // we won't start a new change.
+        if self.status != ReplicaStatus::Normal {
+            return Ok(());
+        }
+
+        self.view = self.next_replica(self.view);
+        self.status = ReplicaStatus::ViewChange;
+
+        let message = Message::StartViewChange(StartViewChangeMessage {
+            new_view: self.view,
+            replica_number: self.replica_number,
+        });
+
+        self.network.broadcast(message)
+    }
+
     fn is_primary(&self) -> bool {
         self.view == self.replica_number
+    }
+
+    fn next_replica(&self, replica_number: usize) -> usize {
+        (replica_number + 1) % self.total
     }
 
     pub fn run(mut self) {
@@ -445,11 +665,14 @@ where
     }
 
     fn get_operation(&self, operation_number: usize) -> Option<&I> {
+        self.get_entry(operation_number)
+            .map(|entry| &entry.operation)
+    }
+
+    fn get_entry(&self, operation_number: usize) -> Option<&LogEntry<I>> {
         // The operation number is a 1-based counter. Thus, we need to subtract 1 to get
         // the associated index
-        self.entries
-            .get(operation_number - 1)
-            .map(|entry| &entry.operation)
+        self.entries.get(operation_number - 1)
     }
 
     fn since(&self, operation_number: usize) -> Log<I> {
@@ -504,9 +727,40 @@ enum ReplicaStatus {
     Recovering,
 }
 
-enum Ack {
+enum PrepareAck {
     Waiting { replicas: HashSet<usize> },
     Executed,
+}
+
+struct ViewAck<I> {
+    old_view: usize,
+    operation_number: usize,
+    commit_number: usize,
+    log: Log<I>,
+}
+
+impl<I> PartialEq for ViewAck<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.old_view == other.old_view && self.operation_number == other.operation_number
+    }
+}
+
+impl<I> Eq for ViewAck<I> {}
+
+impl<I> PartialOrd for ViewAck<I> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<I> Ord for ViewAck<I> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.old_view.cmp(&other.old_view).then_with(|| {
+            self.operation_number
+                .cmp(&other.operation_number)
+                .then_with(|| self.commit_number.cmp(&other.commit_number))
+        })
+    }
 }
 
 #[derive(Error, Debug)]

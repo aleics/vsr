@@ -48,6 +48,15 @@ Normal protocol
  6. The primary informs the backup replicas about the commit when it sends the next Prepare message. However, if the primary does not receive a new client request in a while, it pro-actively informs the backup replicas about the latest commit with a message <Commit, view_number, commit_number>
  7. When a backup learns of a commit, it waits until it has the request in its log and until it has executed all earlier operations. Then it executes the operation by performing the up-call to the service code, increments its commit-number, updates the client's entry in the client table, but does not send the reply to the client.
  8. If a client doesn't receive a timeline response to a request, it re-sends the request to all replicas. This way if the grouped has moved to a later view, its message will reach the new primary. Backups ignore client requests; only the primary processes them.
+
+View change protocol
+ 1. A backup replica has not heard from the primary in a while (either from prepare messages or commit messages) and so, it carries out a view change to switch to a new primary.
+ 2. The replica sets its status to "view-change" and sends a <StartViewChange, new_view, replica_number> to all the other replicas.
+ 3. A replica notices a view change either from its own timer, a StartViewChange message or a DoViewChange message for a view number larger than its own view_number.
+ 4. When a replica receives a StartViewChange message for its view_number from `f` other replicas, it sends a <DoViewChange, old_view, log, new_view, operation_number, commit_number, replica_number> to the replica that will be the primary in the new view.
+ 5. When the new primary receives `f + 1` DoViewChange messages from different replicas (including itself), it sets its view_number to the `new_view` number and selects as the new log the one contained in the message with the largest `old_view`; if several it selects the one with the largest `operation_number`. It sets its `operation_number` to the topmost entry in the log, sets its `commit_number` to the topmost received `commit_number`, changes its statuts to `normal`, and it informs the other replicas about the completion of the view change by sending <StartView, view_number, new log, operation_number, commit_number> to the other replicas.
+ 6. The primary starts to accept client requests again. It also executes (in order) any committed operations that it hadn't executed previously, updates its client table, and sends the replies to the clients.
+ 7. When other replicas receive the StartView message, they replace their log with the one in the message, set their operation_number to that latest entry in the log, set their view_number to the view number in the message, change their status to normal, and update the information in the `client_table`. If there are non-committed operations in the log, they send a `PrepareOk` message to the primary. They execute all operations that were not committed previously, advance their `commit_number` and update their information in the `client_table`.
 */
 
 mod client;
