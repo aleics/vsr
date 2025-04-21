@@ -9,8 +9,8 @@ use thiserror::Error;
 use crate::{
     Message,
     network::{
-        ClientMessage, CommitMessage, PrepareMessage, PrepareOkMessage, ReplicaNetwork,
-        ReplyMessage, RequestMessage,
+        CommitMessage, PrepareMessage, PrepareOkMessage, ReplicaNetwork, ReplyMessage,
+        RequestMessage,
     },
 };
 
@@ -22,7 +22,7 @@ pub trait Service {
 }
 
 /// A single replica
-pub struct Replica<S: Clone + Service, I: Clone + Send, O: Clone + Send> {
+pub struct Replica<S, I, O> {
     /// The current replica number given the configuration
     replica_number: usize,
 
@@ -60,7 +60,12 @@ pub struct Replica<S: Clone + Service, I: Clone + Send, O: Clone + Send> {
     pub(crate) network: ReplicaNetwork<I, O>,
 }
 
-impl<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send> Replica<S, I, O> {
+impl<S, I, O> Replica<S, I, O>
+where
+    S: Service<Input = I, Output = O>,
+    I: Clone + Send,
+    O: Clone + Send,
+{
     pub(crate) fn new(
         replica_number: usize,
         total: usize,
@@ -82,23 +87,12 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send
         }
     }
 
-    fn handle_client_message(&mut self, message: ClientMessage<I>) -> Result<(), ReplicaError> {
-        let message = match message {
-            ClientMessage::Request(request) => Message::Request(request),
-        };
-
-        self.handle_message(message)
-    }
-
-    fn handle_message(&mut self, message: Message<I, O>) -> Result<(), ReplicaError> {
+    fn handle_message(&mut self, message: Message<I>) -> Result<(), ReplicaError> {
         match message {
             Message::Request(request) => self.handle_request(request),
             Message::Prepare(prepare) => self.handle_prepare(prepare),
             Message::PrepareOk(prepare_ok) => self.handle_prepare_ok(prepare_ok),
             Message::Commit(commit) => self.handle_commit(commit),
-            Message::Reply { .. } => {
-                unreachable!("Reply messages should be sent to the client")
-            }
             Message::StartViewChange(start_view_change) => todo!(),
             Message::DoViewChange(do_view_change) => todo!(),
             Message::StartView(start_view) => todo!(),
@@ -126,11 +120,11 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send
 
             if most_recent_request.request_number == request.request_number {
                 if let Some(result) = most_recent_request.response.as_ref() {
-                    let message = Message::Reply(ReplyMessage {
+                    let message = ReplyMessage {
                         view: request.view,
                         request_number: most_recent_request.request_number,
                         result: result.clone(),
-                    });
+                    };
                     return self.network.client.send_out(message, request.client_id);
                 }
             }
@@ -245,11 +239,11 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send
 
         // Send reply message to the client
         self.network.client.send_out(
-            Message::Reply(ReplyMessage {
+            ReplyMessage {
                 view: prepare_ok.view,
                 request_number: request.request_number,
                 result: result.clone(),
-            }),
+            },
             prepare_ok.client_id,
         )?;
 
@@ -290,7 +284,7 @@ impl<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send
         loop {
             select! {
                 recv(self.network.client.incoming.1) -> message => match message {
-                    Ok(message) => self.handle_client_message(message).unwrap(),
+                    Ok(message) => self.handle_message(Message::Request(message)).unwrap(),
                     Err(_) => panic!("something went wrong")
                 },
                 recv(self.network.incoming) -> message => match message {
@@ -309,12 +303,15 @@ pub(crate) fn quorum(total: usize) -> usize {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Log<I: Clone> {
+pub(crate) struct Log<I> {
     /// A queue of log entries for each request sent to the replica.
     entries: Vec<LogEntry<I>>,
 }
 
-impl<I: Clone> Log<I> {
+impl<I> Log<I>
+where
+    I: Clone,
+{
     fn new() -> Self {
         Log {
             entries: Vec::new(),
@@ -342,7 +339,7 @@ impl<I: Clone> Log<I> {
 }
 
 #[derive(Debug, Clone)]
-struct LogEntry<T: Clone> {
+struct LogEntry<T> {
     /// The request number of the log.
     request_number: usize,
     /// The client ID that triggered the request.
@@ -352,9 +349,9 @@ struct LogEntry<T: Clone> {
 }
 
 #[derive(Debug)]
-struct ClientTableEntry<S> {
+struct ClientTableEntry<O> {
     request_number: usize,
-    response: Option<S>,
+    response: Option<O>,
 }
 
 #[derive(Debug, PartialEq)]

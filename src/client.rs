@@ -3,13 +3,10 @@ use std::cell::RefCell;
 use crossbeam::channel::{Receiver, Sender};
 use thiserror::Error;
 
-use crate::{
-    Message,
-    network::{ClientMessage, RequestMessage},
-};
+use crate::network::{ReplyMessage, RequestMessage};
 
 #[derive(Debug)]
-pub struct Client<I: Clone + Send, O: Clone + Send> {
+pub struct Client<I, O> {
     /// Client identification
     client_id: usize,
 
@@ -20,14 +17,18 @@ pub struct Client<I: Clone + Send, O: Clone + Send> {
     next_request_number: RefCell<usize>,
 
     /// Communication channel between a client and the replicas
-    channel: (Sender<ClientMessage<I>>, Receiver<Message<I, O>>),
+    channel: (Sender<RequestMessage<I>>, Receiver<ReplyMessage<O>>),
 }
 
-impl<I: Clone + Send, O: Clone + Send> Client<I, O> {
+impl<I, O> Client<I, O>
+where
+    I: Clone + Send,
+    O: Clone + Send,
+{
     pub(crate) fn new(
         client_id: usize,
         view: usize,
-        channel: (Sender<ClientMessage<I>>, Receiver<Message<I, O>>),
+        channel: (Sender<RequestMessage<I>>, Receiver<ReplyMessage<O>>),
     ) -> Self {
         Client {
             client_id,
@@ -42,12 +43,12 @@ impl<I: Clone + Send, O: Clone + Send> Client<I, O> {
 
         self.channel
             .0
-            .send(ClientMessage::Request(RequestMessage {
+            .send(RequestMessage {
                 client_id: self.client_id,
                 view: self.view,
                 request_number: *request_number,
                 operation,
-            }))
+            })
             .map_err(|_| ClientError::NetworkError)?;
 
         *request_number += 1;
@@ -56,17 +57,13 @@ impl<I: Clone + Send, O: Clone + Send> Client<I, O> {
     }
 
     pub fn recv(&self) -> Result<O, ClientError> {
-        let message = self
+        let reply = self
             .channel
             .1
             .recv()
             .map_err(|_| ClientError::NetworkError)?;
 
-        if let Message::Reply(reply) = message {
-            return Ok(reply.result);
-        }
-
-        unreachable!("Client received another message than a reply");
+        Ok(reply.result)
     }
 }
 

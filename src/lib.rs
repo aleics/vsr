@@ -69,7 +69,7 @@ impl Cluster {
 
         let mut channels = Vec::with_capacity(total);
         for _ in &config.addresses {
-            channels.push(unbounded::<Message<I, O>>())
+            channels.push(unbounded::<Message<I>>())
         }
 
         let mut replicas = Vec::with_capacity(total);
