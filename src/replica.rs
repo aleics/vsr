@@ -220,8 +220,8 @@ where
         );
 
         // Execute previous committed operations by checking the log
-        for commit_number in self.commit_number..prepare.commit_number {
-            let Some(operation) = self.log.get_operation(commit_number + 1) else {
+        for commit_number in (self.commit_number + 1)..=prepare.commit_number {
+            let Some(operation) = self.log.get_operation(commit_number) else {
                 // Log state is incorrect. Intermediate operations are missing
                 return Err(ReplicaError::InvalidState);
             };
@@ -335,9 +335,9 @@ where
             return self.trigger_state_transfer();
         }
 
-        // Execute previous committed operations by checking the log
-        for commit_number in self.commit_number..commit.operation_number {
-            let Some(operation) = self.log.get_operation(commit_number + 1) else {
+        // Execute uncommitted operations by checking the log
+        for commit_number in (self.commit_number + 1)..=commit.operation_number {
+            let Some(operation) = self.log.get_operation(commit_number) else {
                 // Log state is incorrect. Intermediate operations are missing
                 return Err(ReplicaError::InvalidState);
             };
