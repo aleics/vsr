@@ -73,7 +73,7 @@ impl Cluster {
     pub fn create<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send>(
         config: &Config,
         service: S,
-    ) -> Vec<Replica<S, I, O>> {
+    ) -> Vec<Replica<S, ReplicaNetwork<I, O>, I, O>> {
         let total = config.addresses.len();
 
         let mut channels = Vec::with_capacity(total);
@@ -99,7 +99,7 @@ impl Cluster {
         I: Clone + Send,
         O: Clone + Send,
     >(
-        replicas: &mut Vec<Replica<S, I, O>>,
+        replicas: &mut Vec<Replica<S, ReplicaNetwork<I, O>, I, O>>,
     ) -> Client<I, O> {
         let primary = Self::primary(replicas);
 
@@ -110,7 +110,7 @@ impl Cluster {
     }
 
     fn primary<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send>(
-        replicas: &Vec<Replica<S, I, O>>,
+        replicas: &Vec<Replica<S, ReplicaNetwork<I, O>, I, O>>,
     ) -> usize {
         assert!(!replicas.is_empty());
 

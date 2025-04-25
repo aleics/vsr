@@ -10,9 +10,9 @@ use thiserror::Error;
 use crate::{
     Message,
     network::{
-        CommitMessage, DoViewChangeMessage, GetStateMessage, NewStateMessage, PrepareMessage,
-        PrepareOkMessage, ReplicaNetwork, ReplyMessage, RequestMessage, StartViewChangeMessage,
-        StartViewMessage,
+        CommitMessage, DoViewChangeMessage, GetStateMessage, Network, NewStateMessage,
+        PrepareMessage, PrepareOkMessage, ReplicaNetwork, ReplyMessage, RequestMessage,
+        StartViewChangeMessage, StartViewMessage,
     },
 };
 
@@ -28,7 +28,7 @@ const COMMIT_TIMEOUT_MS: Duration = Duration::from_millis(200);
 const IDLE_TIMEOUT_MS: Duration = Duration::from_millis(2000);
 
 /// A single replica
-pub struct Replica<S, I, O> {
+pub struct Replica<S, N, I, O> {
     /// The current replica number given the configuration
     replica_number: usize,
 
@@ -71,21 +71,17 @@ pub struct Replica<S, I, O> {
 
     /// Network of the replica containing connections to all the replicas
     /// and the client
-    pub(crate) network: ReplicaNetwork<I, O>,
+    pub(crate) network: N,
 }
 
-impl<S, I, O> Replica<S, I, O>
+impl<S, I, N, O> Replica<S, N, I, O>
 where
     S: Service<Input = I, Output = O>,
+    N: Network<Input = I, Output = O>,
     I: Clone + Send,
     O: Clone + Send,
 {
-    pub(crate) fn new(
-        replica_number: usize,
-        total: usize,
-        service: S,
-        network: ReplicaNetwork<I, O>,
-    ) -> Self {
+    pub(crate) fn new(replica_number: usize, total: usize, service: S, network: N) -> Self {
         Replica {
             replica_number,
             view: 0,
@@ -150,7 +146,7 @@ where
                         request_number: most_recent_request.request_number,
                         result: result.clone(),
                     };
-                    return self.network.client.send_out(message, request.client_id);
+                    return self.network.send_client(message, request.client_id);
                 }
             }
         }
@@ -293,7 +289,7 @@ where
             .expect("Client must be present in the client table since the request message has been already received");
 
         // Send reply message to the client
-        self.network.client.send_out(
+        self.network.send_client(
             ReplyMessage {
                 view: prepare_ok.view,
                 request_number: client_request.request_number,
@@ -485,7 +481,7 @@ where
                 // Execute the operation and send reply to the client
                 let result = self.service.execute(&log_entry.operation);
 
-                self.network.client.send_out(
+                self.network.send_client(
                     ReplyMessage {
                         view: self.view,
                         request_number: log_entry.request_number,
@@ -614,7 +610,14 @@ where
     fn next_replica(&self, replica_number: usize) -> usize {
         (replica_number + 1) % self.total
     }
+}
 
+impl<S, I, O> Replica<S, ReplicaNetwork<I, O>, I, O>
+where
+    S: Service<Input = I, Output = O>,
+    I: Clone + Send,
+    O: Clone + Send,
+{
     pub fn run(mut self) {
         let ticker = tick(PERIODIC_INTERVAL);
 
@@ -640,7 +643,7 @@ pub(crate) fn quorum(total: usize) -> usize {
     (total - 1) / 2
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Log<I> {
     /// A queue of log entries for each request sent to the replica.
     entries: Vec<LogEntry<I>>,
@@ -704,7 +707,7 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct LogEntry<T> {
     /// The request number of the log.
     request_number: usize,
@@ -714,7 +717,7 @@ struct LogEntry<T> {
     operation: T,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct ClientTableEntry<O> {
     request_number: usize,
     response: Option<O>,
@@ -763,7 +766,7 @@ impl<I> Ord for ViewAck<I> {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum ReplicaError {
     #[error("A message could not be sent or received")]
     NetworkError,
@@ -773,4 +776,188 @@ pub enum ReplicaError {
     InvalidState,
     #[error("View mismatch between client and replica")]
     MessageViewMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, collections::HashMap};
+
+    use crate::{
+        network::{Message, Network, PrepareMessage, ReplyMessage, RequestMessage},
+        replica::{ClientTableEntry, Log, ReplicaError},
+    };
+
+    use super::{Replica, Service};
+
+    struct MockNetwork {
+        incoming: RefCell<HashMap<usize, Message<usize>>>,
+        outgoing: RefCell<HashMap<usize, ReplyMessage<usize>>>,
+        connected_replicas: Vec<usize>,
+    }
+
+    impl MockNetwork {
+        fn new(connected_replicas: Vec<usize>) -> Self {
+            MockNetwork {
+                incoming: RefCell::new(HashMap::new()),
+                outgoing: RefCell::new(HashMap::new()),
+                connected_replicas,
+            }
+        }
+    }
+
+    impl Network for MockNetwork {
+        type Input = usize;
+        type Output = usize;
+
+        fn send(
+            &self,
+            message: Message<Self::Input>,
+            replica: &usize,
+        ) -> Result<(), super::ReplicaError> {
+            let mut incoming = self.incoming.borrow_mut();
+            incoming.insert(*replica, message);
+            Ok(())
+        }
+
+        fn broadcast(&self, message: Message<Self::Input>) -> Result<(), super::ReplicaError> {
+            let mut incoming = self.incoming.borrow_mut();
+            for replica in &self.connected_replicas {
+                incoming.insert(*replica, message.clone());
+            }
+            Ok(())
+        }
+
+        fn send_client(
+            &self,
+            message: ReplyMessage<Self::Output>,
+            client_id: usize,
+        ) -> Result<(), super::ReplicaError> {
+            let mut outgoing = self.outgoing.borrow_mut();
+            outgoing.insert(client_id, message);
+
+            Ok(())
+        }
+    }
+
+    struct MockService;
+
+    impl Service for MockService {
+        type Input = usize;
+        type Output = usize;
+
+        fn execute(&self, input: &Self::Input) -> Self::Output {
+            input + 1
+        }
+    }
+
+    fn create_replica(total: usize) -> Replica<MockService, MockNetwork, usize, usize> {
+        assert!(total > 0);
+
+        let connected = (1..total).collect::<Vec<usize>>();
+
+        let replica_number = 0;
+        let service = MockService;
+        let network = MockNetwork::new(connected);
+
+        Replica::new(replica_number, total, service, network)
+    }
+
+    #[test]
+    fn handles_request_message() {
+        // given
+        let request = Message::Request(RequestMessage {
+            view: 0,
+            request_number: 1,
+            client_id: 1,
+            operation: 0,
+        });
+        let mut replica = create_replica(3);
+
+        // when
+        let result = replica.handle_message(request.clone());
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        let prepare = Message::Prepare(PrepareMessage {
+            view: 0,
+            operation_number: 1,
+            commit_number: 0,
+            request: RequestMessage {
+                view: 0,
+                request_number: 1,
+                client_id: 1,
+                operation: 0,
+            },
+        });
+
+        // state is correct
+        assert_eq!(replica.replica_number, 0);
+        assert_eq!(replica.view, 0);
+        assert_eq!(replica.total, 3);
+        assert_eq!(replica.operation_number, 1);
+        assert_eq!(replica.commit_number, 0);
+
+        // prepare messages are sent
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(1, prepare.clone()), (2, prepare.clone())])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+
+        // log is correct
+        let mut log = Log::new();
+        log.append(0, 1, 1);
+        assert_eq!(replica.log, log);
+
+        // client table is correct
+        let mut client_table = HashMap::new();
+        client_table.insert(
+            1,
+            ClientTableEntry {
+                request_number: 1,
+                response: None,
+            },
+        );
+        assert_eq!(replica.client_table, client_table);
+    }
+
+    #[test]
+    fn backup_replica_ignores_requests() {
+        // given
+        let request = Message::Request(RequestMessage {
+            view: 1,
+            request_number: 1,
+            client_id: 1,
+            operation: 0,
+        });
+        let mut replica = create_replica(3);
+        replica.view = 1;
+
+        // when
+        let result = replica.handle_message(request.clone());
+
+        // then
+        assert_eq!(result, Ok(()));
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_invalid_view_sent_by_client() {
+        // given
+        let request = Message::Request(RequestMessage {
+            view: 1,
+            request_number: 1,
+            client_id: 1,
+            operation: 0,
+        });
+        let mut replica = create_replica(3);
+
+        // when
+        let result = replica.handle_message(request.clone());
+
+        // then
+        assert_eq!(result, Err(ReplicaError::MessageViewMismatch));
+    }
 }
