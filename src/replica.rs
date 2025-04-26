@@ -441,15 +441,14 @@ where
         // When the primary received `quorum + 1` `DoViewChange` messages from different replicas
         // (including itself), it sets its view number to that in the messages as selects as the
         // new log the one contained in the message with the largest view.
+        self.view_acks.push(ViewAck {
+            old_view: do_view_change.old_view,
+            operation_number: do_view_change.operation_number,
+            commit_number: do_view_change.commit_number,
+            log: do_view_change.log,
+        });
 
         if self.view_acks.len() < quorum(self.total) {
-            self.view_acks.push(ViewAck {
-                old_view: do_view_change.old_view,
-                operation_number: do_view_change.operation_number,
-                commit_number: do_view_change.commit_number,
-                log: do_view_change.log,
-            });
-
             return Ok(());
         }
 
@@ -458,19 +457,9 @@ where
             self.status = ReplicaStatus::ViewChange;
         }
 
-        let new_view =
-            self.view_acks.drain().next().expect(
-                "View acknowledgements are more than the quorum. At least 1 entry is present.",
-            );
-
-        let message = Message::StartView(StartViewMessage {
-            view: self.view,
-            log: new_view.log.clone(),
-            operation_number: self.operation_number,
-            commit_number: self.commit_number,
-        });
-
-        self.network.broadcast(message)?;
+        let new_view = self.view_acks.drain().next().expect(
+            "View acknowledgements are more than the quorum. At least 1 entry must be present.",
+        );
 
         self.status = ReplicaStatus::Normal;
 
@@ -517,15 +506,24 @@ where
 
         self.view_acks.clear();
 
+        let message = Message::StartView(StartViewMessage {
+            view: self.view,
+            log: self.log.clone(),
+            operation_number: self.operation_number,
+            commit_number: self.commit_number,
+        });
+
+        self.network.broadcast(message)?;
+
         Ok(())
     }
 
     fn handle_start_view(&mut self, start_view: StartViewMessage<I>) -> Result<(), ReplicaError> {
         // Refresh internal state with the new view
         self.status = ReplicaStatus::Normal;
+        self.view = start_view.view;
         self.log = start_view.log;
         self.operation_number = start_view.operation_number;
-        self.view = start_view.view;
 
         // Iterate over all the uncommitted operations in the log in order
         if self.operation_number > self.commit_number {
@@ -745,6 +743,7 @@ enum PrepareAck {
     Executed,
 }
 
+#[derive(Debug)]
 struct ViewAck<I> {
     old_view: usize,
     operation_number: usize,
@@ -790,14 +789,22 @@ pub enum ReplicaError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap};
+    use std::{
+        cell::RefCell,
+        collections::{BinaryHeap, HashMap},
+        time::Instant,
+    };
 
     use crate::{
         network::{
-            CommitMessage, GetStateMessage, Message, Network, NewStateMessage, PrepareMessage,
-            PrepareOkMessage, ReplyMessage, RequestMessage,
+            CommitMessage, DoViewChangeMessage, GetStateMessage, Message, Network, NewStateMessage,
+            PrepareMessage, PrepareOkMessage, ReplyMessage, RequestMessage, StartViewChangeMessage,
+            StartViewMessage,
         },
-        replica::{ClientTableEntry, Log, LogEntry, PrepareAck, ReplicaError},
+        replica::{
+            ClientTableEntry, IDLE_TIMEOUT_MS, Log, LogEntry, PrepareAck, ReplicaError,
+            ReplicaStatus, ViewAck,
+        },
     };
 
     use super::{Replica, Service};
@@ -1176,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_prepare_ok_waits_for_acks() {
+    fn handles_prepare_ok_waits_for_quorum() {
         // given
         let prepare_ok = Message::PrepareOk(PrepareOkMessage {
             view: 0,
@@ -1368,8 +1375,322 @@ mod tests {
         log.append(2, 3, 1);
         assert_eq!(replica.log, log);
 
-        // new_state message sent
+        // no message sent
         assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn triggers_view_change() {
+        // given
+        let mut replica = create_backup(3);
+        replica.committed_at = Instant::now() - (IDLE_TIMEOUT_MS * 2);
+
+        // when
+        let result = replica.periodic();
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.status, ReplicaStatus::ViewChange);
+
+        // start_view_change messages sent
+        let start_view_change = Message::StartViewChange(StartViewChangeMessage {
+            new_view: 1,
+            replica_number: 1,
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([
+                (0, start_view_change.clone()),
+                (2, start_view_change.clone())
+            ])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn triggers_view_change_respects_replica_status() {
+        // given
+        let mut replica = create_backup(3);
+        replica.view = 0;
+        replica.committed_at = Instant::now() - (IDLE_TIMEOUT_MS * 2);
+        replica.status = ReplicaStatus::ViewChange;
+
+        // when
+        let result = replica.periodic();
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.status, ReplicaStatus::ViewChange);
+
+        // no message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_start_view_change() {
+        // given
+        let start_view_change = Message::StartViewChange(StartViewChangeMessage {
+            new_view: 1,
+            replica_number: 1,
+        });
+        let mut replica = create_primary(3);
+        replica.operation_number = 1;
+        replica.log.append(0, 1, 1);
+
+        // when
+        let result = replica.handle_message(start_view_change);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.view, 1);
+        assert_eq!(replica.status, ReplicaStatus::ViewChange);
+
+        // do_view_change message sent
+        let do_view_change = Message::DoViewChange(DoViewChangeMessage {
+            old_view: 0,
+            new_view: 1,
+            log: Log {
+                entries: vec![LogEntry {
+                    request_number: 1,
+                    client_id: 1,
+                    operation: 0,
+                }],
+            },
+            operation_number: 1,
+            commit_number: 0,
+            replica_number: 0,
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(1, do_view_change)])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_start_view_change_new_primary_acknowledges() {
+        // given
+        let start_view_change = Message::StartViewChange(StartViewChangeMessage {
+            new_view: 1,
+            replica_number: 1,
+        });
+        let mut replica = create_backup(3);
+        replica.view = 0;
+        replica.operation_number = 1;
+        replica.log.append(0, 1, 1);
+
+        // when
+        let result = replica.handle_message(start_view_change);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.view, 1);
+        assert_eq!(replica.status, ReplicaStatus::ViewChange);
+
+        // acks are set
+        let view_acks = replica.view_acks.as_slice();
+        assert_eq!(
+            view_acks,
+            &[ViewAck {
+                old_view: 0,
+                operation_number: 1,
+                commit_number: 0,
+                log: Log {
+                    entries: vec![LogEntry {
+                        request_number: 1,
+                        client_id: 1,
+                        operation: 0,
+                    }],
+                },
+            }]
+        );
+
+        // no message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_do_view_change() {
+        // given
+        let mut message_log = Log::new();
+        message_log.append(0, 1, 1);
+        message_log.append(1, 2, 1);
+        let do_view_change = Message::DoViewChange(DoViewChangeMessage {
+            old_view: 0,
+            new_view: 1,
+            log: message_log.clone(),
+            operation_number: 2,
+            commit_number: 1,
+            replica_number: 0,
+        });
+
+        let mut replica = create_backup(3);
+        replica.view_acks = BinaryHeap::from([ViewAck {
+            old_view: 0,
+            operation_number: 1,
+            commit_number: 0,
+            log: Log {
+                entries: vec![LogEntry {
+                    request_number: 1,
+                    client_id: 1,
+                    operation: 0,
+                }],
+            },
+        }]);
+        replica.operation_number = 1;
+        replica.log.append(0, 1, 1);
+
+        // when
+        let result = replica.handle_message(do_view_change);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.operation_number, 2);
+        assert_eq!(replica.log, message_log.clone());
+        assert_eq!(replica.commit_number, 1);
+        assert_eq!(
+            replica.client_table,
+            HashMap::from_iter([(
+                1,
+                ClientTableEntry {
+                    request_number: 2,
+                    response: Some(2)
+                }
+            )])
+        );
+
+        // start_view messages sent
+        let start_view = Message::StartView(StartViewMessage {
+            view: 1,
+            log: message_log,
+            operation_number: 2,
+            commit_number: 1,
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(0, start_view.clone()), (2, start_view.clone())])
+        );
+
+        // reply messages sent
+        assert_eq!(
+            *replica.network.outgoing.borrow(),
+            HashMap::from_iter([(
+                1,
+                ReplyMessage {
+                    view: 1,
+                    request_number: 2,
+                    result: 2
+                }
+            )])
+        );
+    }
+
+    #[test]
+    fn handles_do_view_change_waits_for_quorum() {
+        // given
+        let mut message_log = Log::new();
+        message_log.append(0, 1, 1);
+        message_log.append(1, 2, 1);
+        let do_view_change = Message::DoViewChange(DoViewChangeMessage {
+            old_view: 0,
+            new_view: 1,
+            log: message_log.clone(),
+            operation_number: 2,
+            commit_number: 1,
+            replica_number: 0,
+        });
+
+        let mut replica = create_backup(5);
+
+        // when
+        let result = replica.handle_message(do_view_change);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(
+            replica.view_acks.as_slice(),
+            &[ViewAck {
+                old_view: 0,
+                operation_number: 2,
+                commit_number: 0,
+                log: message_log.clone()
+            }]
+        );
+
+        // no messages sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_start_view() {
+        // given
+        let mut message_log = Log::new();
+        message_log.append(0, 1, 1);
+        message_log.append(1, 2, 1);
+        let start_view = Message::StartView(StartViewMessage {
+            view: 1,
+            log: message_log.clone(),
+            operation_number: 2,
+            commit_number: 1,
+        });
+
+        let mut replica = create_primary(3);
+        replica.view = 0;
+        replica.operation_number = 1;
+        replica.log.append(0, 1, 1);
+
+        // when
+        let result = replica.handle_message(start_view);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.status, ReplicaStatus::Normal);
+        assert_eq!(replica.view, 1);
+        assert_eq!(replica.log, message_log.clone());
+        assert_eq!(replica.operation_number, 2);
+        assert_eq!(replica.commit_number, 1);
+        assert_eq!(
+            replica.client_table,
+            HashMap::from_iter([(
+                1,
+                ClientTableEntry {
+                    request_number: 2,
+                    response: Some(2)
+                }
+            )])
+        );
+
+        // prepare_ok message is sent to new replica
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(
+                1,
+                Message::PrepareOk(PrepareOkMessage {
+                    view: 1,
+                    operation_number: 2,
+                    replica_number: 0,
+                    client_id: 1,
+                })
+            )])
+        );
         assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 }
