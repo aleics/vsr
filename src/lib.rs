@@ -57,6 +57,11 @@ View change protocol
  5. When the new primary receives `f + 1` DoViewChange messages from different replicas (including itself), it sets its view_number to the `new_view` number and selects as the new log the one contained in the message with the largest `old_view`; if several it selects the one with the largest `operation_number`. It sets its `operation_number` to the topmost entry in the log, sets its `commit_number` to the topmost received `commit_number`, changes its statuts to `normal`, and it informs the other replicas about the completion of the view change by sending <StartView, view_number, new log, operation_number, commit_number> to the other replicas.
  6. The primary starts to accept client requests again. It also executes (in order) any committed operations that it hadn't executed previously, updates its client table, and sends the replies to the clients.
  7. When other replicas receive the StartView message, they replace their log with the one in the message, set their operation_number to that latest entry in the log, set their view_number to the view number in the message, change their status to normal, and update the information in the `client_table`. If there are non-committed operations in the log, they send a `PrepareOk` message to the primary. They execute all operations that were not committed previously, advance their `commit_number` and update their information in the `client_table`.
+
+Recovery protocol
+ 1. A recovering replica sends a <Recovery, replica_number, nonce> to all the other replicas. `nonce` is a random unique number.
+ 2. Another replica responds the message <RecoveryResponse, view_number, nonce, log, operation_number, commit_number> only when its status is normal. Only the primary replica sends `log`, `operation_number`, `commit_number`. A backup replica won't provide those.
+ 3. The recovering replica waits to receiver at least `quorum + 1` messages from different replicas with the `nonce` value sent, including one from the primary of the latest view it learns of these messages. Then, it updates its state using the information from the primary, changes its status to normal and is available to receive more requests.
 */
 
 mod client;

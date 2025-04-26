@@ -15,6 +15,8 @@ pub enum Message<I> {
     StartViewChange(StartViewChangeMessage),
     DoViewChange(DoViewChangeMessage<I>),
     StartView(StartViewMessage<I>),
+    Recovery(RecoveryMessage),
+    RecoveryResponse(RecoveryResponseMessage<I>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +83,26 @@ pub struct DoViewChangeMessage<I> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartViewMessage<I> {
     pub(crate) view: usize,
+    pub(crate) log: Log<I>,
+    pub(crate) operation_number: usize,
+    pub(crate) commit_number: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryMessage {
+    pub(crate) replica_number: usize,
+    pub(crate) nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryResponseMessage<I> {
+    pub(crate) view: usize,
+    pub(crate) nonce: u64,
+    pub(crate) primary: Option<RecoveryPrimaryResponse<I>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryPrimaryResponse<I> {
     pub(crate) log: Log<I>,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,

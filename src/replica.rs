@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam::{channel::tick, select};
@@ -11,7 +11,8 @@ use crate::{
     Message,
     network::{
         CommitMessage, DoViewChangeMessage, GetStateMessage, Network, NewStateMessage,
-        PrepareMessage, PrepareOkMessage, ReplicaNetwork, ReplyMessage, RequestMessage,
+        PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
+        RecoveryResponseMessage, ReplicaNetwork, ReplyMessage, RequestMessage,
         StartViewChangeMessage, StartViewMessage,
     },
 };
@@ -50,7 +51,11 @@ pub struct Replica<S, N, I, O> {
     /// this operation.
     prepare_acks: HashMap<usize, PrepareAck>,
 
+    /// Heap with the view change acknowledgements sorted by latest view and
+    /// operation number
     view_acks: BinaryHeap<ViewAck<I>>,
+
+    recovery_acks: Vec<RecoveryAck<I>>,
 
     /// Log entries of size "operation_number" containing the requests
     /// that have been received so far in their assigned order.
@@ -93,6 +98,7 @@ where
             committed_at: Instant::now(),
             prepare_acks: HashMap::default(),
             view_acks: BinaryHeap::new(),
+            recovery_acks: Vec::new(),
             client_table: HashMap::default(),
             network,
             service,
@@ -112,6 +118,10 @@ where
             }
             Message::DoViewChange(do_view_change) => self.handle_do_view_change(do_view_change),
             Message::StartView(start_view) => self.handle_start_view(start_view),
+            Message::Recovery(recovery) => self.handle_recovery(recovery),
+            Message::RecoveryResponse(recovery_response) => {
+                self.handle_recovery_response(recovery_response)
+            }
         }
     }
 
@@ -565,6 +575,117 @@ where
         Ok(())
     }
 
+    fn handle_recovery(&mut self, recovery: RecoveryMessage) -> Result<(), ReplicaError> {
+        // A replica won't respond to a recovery if it's not operational
+        assert!(self.status == ReplicaStatus::Normal);
+
+        let response = if self.is_primary() {
+            RecoveryResponseMessage {
+                view: self.view,
+                nonce: recovery.nonce,
+                primary: Some(RecoveryPrimaryResponse {
+                    log: self.log.clone(),
+                    operation_number: self.operation_number,
+                    commit_number: self.commit_number,
+                }),
+            }
+        } else {
+            RecoveryResponseMessage {
+                view: self.view,
+                nonce: recovery.nonce,
+                primary: None,
+            }
+        };
+
+        self.network.send(
+            Message::RecoveryResponse(response),
+            &recovery.replica_number,
+        )
+    }
+
+    fn handle_recovery_response(
+        &mut self,
+        recovery_response: RecoveryResponseMessage<I>,
+    ) -> Result<(), ReplicaError> {
+        match self.status {
+            ReplicaStatus::Recovering { nonce } => assert!(nonce == recovery_response.nonce),
+            _ => panic!("Replica must be in recovering status to handle recovery responses"),
+        }
+
+        // Attach recovery acknowledgements and check if quorum is reached
+        self.recovery_acks
+            .push(RecoveryAck::from_message(recovery_response));
+
+        if self.recovery_acks.len() < (quorum(self.total) + 1) {
+            return Ok(());
+        };
+
+        // Read the primary acknowledgements of the latest view. If no acknowledgement from the
+        // primary replicas has been received, the recovering replica must wait.
+        let mut ready_ack: Option<&RecoveryPrimaryAck<I>> = None;
+        for recovery_ack in &self.recovery_acks {
+            if let Some(primary_ack) = recovery_ack.primary.as_ref() {
+                if let Some(current) = ready_ack {
+                    if current.view > primary_ack.view {
+                        ready_ack = Some(current);
+                    } else {
+                        ready_ack = Some(primary_ack);
+                    }
+                } else {
+                    ready_ack = Some(primary_ack);
+                }
+            }
+        }
+
+        // The recovering replica must wait for the primary to acknowledge the recovery
+        let Some(RecoveryPrimaryAck {
+            log,
+            operation_number,
+            commit_number,
+            view,
+        }) = ready_ack
+        else {
+            return Ok(());
+        };
+
+        self.view = *view;
+        self.operation_number = *operation_number;
+        self.log = log.clone();
+
+        // Execute previous committed operations by checking the log
+        let recovery_commit_number = *commit_number;
+        let mut executed_requests = HashMap::new();
+        for commit_number in (self.commit_number + 1)..=recovery_commit_number {
+            let Some(log_entry) = self.log.get_entry(commit_number) else {
+                // Log state is incorrect. Intermediate operations are missing
+                return Err(ReplicaError::InvalidState);
+            };
+
+            let result = self.service.execute(&log_entry.operation);
+
+            executed_requests.insert(
+                log_entry.client_id,
+                ClientTableEntry {
+                    request_number: log_entry.request_number,
+                    response: Some(result),
+                },
+            );
+        }
+
+        // Refresh commit and client table
+        self.commit_number = recovery_commit_number;
+        self.committed_at = Instant::now();
+        self.client_table.extend(executed_requests);
+
+        // Replica is available for handling messages
+        self.status = ReplicaStatus::Normal;
+
+        // Clear acks
+        self.recovery_acks.clear();
+
+        Ok(())
+    }
+
     fn periodic(&mut self) -> Result<(), ReplicaError> {
         // Primary periodic tasks
         if self.is_primary() {
@@ -610,6 +731,18 @@ where
         self.network.broadcast(message)
     }
 
+    fn trigger_recovery(&mut self) -> Result<(), ReplicaError> {
+        let nonce = nonce();
+        self.status = ReplicaStatus::Recovering { nonce };
+
+        let message = Message::Recovery(RecoveryMessage {
+            replica_number: self.replica_number,
+            nonce,
+        });
+
+        self.network.broadcast(message)
+    }
+
     fn is_primary(&self) -> bool {
         self.view == self.replica_number
     }
@@ -648,6 +781,13 @@ pub(crate) fn quorum(total: usize) -> usize {
     // total = 2 * f + 1
     // f = (total - 1) / 2
     (total - 1) / 2
+}
+
+/// Create a nonce ("number used once") using the current system time
+/// and the UNIX epoch time.
+fn nonce() -> u64 {
+    let now = SystemTime::now();
+    now.duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -734,7 +874,7 @@ struct ClientTableEntry<O> {
 enum ReplicaStatus {
     Normal,
     ViewChange,
-    Recovering,
+    Recovering { nonce: u64 },
 }
 
 #[derive(Debug, PartialEq)]
@@ -775,6 +915,36 @@ impl<I> Ord for ViewAck<I> {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct RecoveryAck<I> {
+    primary: Option<RecoveryPrimaryAck<I>>,
+    view: usize,
+}
+
+impl<I> RecoveryAck<I> {
+    fn from_message(message: RecoveryResponseMessage<I>) -> Self {
+        let primary = message.primary.map(|response| RecoveryPrimaryAck {
+            log: response.log,
+            operation_number: response.operation_number,
+            commit_number: response.commit_number,
+            view: message.view,
+        });
+
+        RecoveryAck {
+            primary,
+            view: message.view,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct RecoveryPrimaryAck<I> {
+    log: Log<I>,
+    operation_number: usize,
+    commit_number: usize,
+    view: usize,
+}
+
 #[derive(Error, Debug, PartialEq)]
 pub enum ReplicaError {
     #[error("A message could not be sent or received")]
@@ -798,12 +968,13 @@ mod tests {
     use crate::{
         network::{
             CommitMessage, DoViewChangeMessage, GetStateMessage, Message, Network, NewStateMessage,
-            PrepareMessage, PrepareOkMessage, ReplyMessage, RequestMessage, StartViewChangeMessage,
+            PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
+            RecoveryResponseMessage, ReplyMessage, RequestMessage, StartViewChangeMessage,
             StartViewMessage,
         },
         replica::{
-            ClientTableEntry, IDLE_TIMEOUT_MS, Log, LogEntry, PrepareAck, ReplicaError,
-            ReplicaStatus, ViewAck,
+            ClientTableEntry, IDLE_TIMEOUT_MS, Log, LogEntry, PrepareAck, RecoveryAck,
+            RecoveryPrimaryAck, ReplicaError, ReplicaStatus, ViewAck,
         },
     };
 
@@ -1691,6 +1862,271 @@ mod tests {
                 })
             )])
         );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn triggers_recovery() {
+        // given
+        let mut replica = create_backup(3);
+
+        // when
+        let result = replica.trigger_recovery();
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert!(matches!(replica.status, ReplicaStatus::Recovering { .. }));
+
+        // prepare_ok message is sent to new replica
+        let incoming_messages = replica.network.incoming.borrow();
+        assert_eq!(incoming_messages.len(), 2);
+
+        let Message::Recovery(RecoveryMessage { replica_number, .. }) =
+            incoming_messages.get(&0).unwrap()
+        else {
+            panic!("unexpected message")
+        };
+        assert_eq!(replica_number, &1);
+        let Message::Recovery(RecoveryMessage { replica_number, .. }) =
+            incoming_messages.get(&2).unwrap()
+        else {
+            panic!("unexpected message")
+        };
+        assert_eq!(replica_number, &1);
+
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_recovery() {
+        // given
+        let recovery = Message::Recovery(RecoveryMessage {
+            replica_number: 1,
+            nonce: 1234,
+        });
+        let mut replica = create_primary(3);
+        replica.view = 0;
+        replica.commit_number = 1;
+        replica.operation_number = 2;
+        replica.log.append(0, 1, 1);
+        replica.log.append(1, 2, 1);
+
+        // when
+        let result = replica.handle_message(recovery);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // recovery_response message is sent to recovering replica
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(
+                1,
+                Message::RecoveryResponse(RecoveryResponseMessage {
+                    view: 0,
+                    nonce: 1234,
+                    primary: Some(RecoveryPrimaryResponse {
+                        log: replica.log.clone(),
+                        operation_number: 2,
+                        commit_number: 1
+                    })
+                })
+            )])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_recovery_backup_replica() {
+        // given
+        let recovery = Message::Recovery(RecoveryMessage {
+            replica_number: 1,
+            nonce: 1234,
+        });
+        let mut replica = create_backup(3);
+        replica.view = 0;
+        replica.commit_number = 1;
+        replica.operation_number = 2;
+        replica.log.append(0, 1, 1);
+        replica.log.append(1, 2, 1);
+
+        // when
+        let result = replica.handle_message(recovery);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // recovery_response message is sent to recovering replica
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(
+                1,
+                Message::RecoveryResponse(RecoveryResponseMessage {
+                    view: 0,
+                    nonce: 1234,
+                    primary: None
+                })
+            )])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_recovery_response() {
+        // given
+        let mut log = Log::new();
+        log.append(0, 1, 1);
+        log.append(1, 2, 1);
+
+        let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
+            view: 2,
+            nonce: 1234,
+            primary: Some(RecoveryPrimaryResponse {
+                log: log.clone(),
+                operation_number: 2,
+                commit_number: 1,
+            }),
+        });
+        let mut replica = create_backup(3);
+        replica.status = ReplicaStatus::Recovering { nonce: 1234 };
+        replica.recovery_acks.push(RecoveryAck {
+            primary: Some(RecoveryPrimaryAck {
+                log: Log {
+                    entries: vec![LogEntry {
+                        request_number: 1,
+                        client_id: 1,
+                        operation: 0,
+                    }],
+                },
+                operation_number: 1,
+                commit_number: 0,
+                view: 1,
+            }),
+            view: 1,
+        });
+        replica.recovery_acks.push(RecoveryAck {
+            primary: None,
+            view: 2,
+        });
+
+        // when
+        let result = replica.handle_message(recovery_response);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.view, 2);
+        assert_eq!(replica.operation_number, 2);
+        assert_eq!(replica.log, log);
+        assert_eq!(replica.commit_number, 1);
+        assert_eq!(
+            replica.client_table,
+            HashMap::from_iter([(
+                1,
+                ClientTableEntry {
+                    request_number: 1,
+                    response: Some(1)
+                }
+            )])
+        );
+        assert_eq!(replica.status, ReplicaStatus::Normal);
+
+        // no message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_recovery_response_waits_for_quorum() {
+        // given
+        let mut log = Log::new();
+        log.append(0, 1, 1);
+        log.append(1, 2, 1);
+
+        let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
+            view: 2,
+            nonce: 1234,
+            primary: Some(RecoveryPrimaryResponse {
+                log: log.clone(),
+                operation_number: 2,
+                commit_number: 1,
+            }),
+        });
+        let mut replica = create_backup(3);
+        replica.status = ReplicaStatus::Recovering { nonce: 1234 };
+
+        // when
+        let result = replica.handle_message(recovery_response);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.operation_number, 0);
+        assert_eq!(
+            replica.recovery_acks,
+            vec![RecoveryAck {
+                primary: Some(RecoveryPrimaryAck {
+                    log: log.clone(),
+                    operation_number: 2,
+                    commit_number: 1,
+                    view: 2,
+                }),
+                view: 2,
+            }]
+        );
+
+        // no message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_recovery_response_waits_for_primary_ack() {
+        // given
+        let mut log = Log::new();
+        log.append(0, 1, 1);
+        log.append(1, 2, 1);
+
+        let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
+            view: 2,
+            nonce: 1234,
+            primary: None,
+        });
+        let mut replica = create_backup(3);
+        replica.status = ReplicaStatus::Recovering { nonce: 1234 };
+        replica.recovery_acks.push(RecoveryAck {
+            primary: None,
+            view: 2,
+        });
+
+        // when
+        let result = replica.handle_message(recovery_response);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.operation_number, 0);
+        assert_eq!(
+            replica.recovery_acks,
+            vec![
+                RecoveryAck {
+                    primary: None,
+                    view: 2
+                },
+                RecoveryAck {
+                    primary: None,
+                    view: 2
+                }
+            ]
+        );
+
+        // no message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
         assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 }
