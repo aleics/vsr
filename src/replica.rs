@@ -744,11 +744,11 @@ where
     }
 
     fn is_primary(&self) -> bool {
-        self.view == self.replica_number
+        (self.view % self.total) == self.replica_number
     }
 
     fn next_replica(&self, replica_number: usize) -> usize {
-        (replica_number + 1) % self.total
+        replica_number + 1
     }
 }
 
