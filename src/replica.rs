@@ -224,7 +224,6 @@ where
 
             self.service.execute(operation);
         }
-
         self.commit_number = prepare.commit_number;
         self.committed_at = Instant::now();
 
@@ -380,6 +379,16 @@ where
 
         self.log.merge(new_state.log_after_operation);
         self.operation_number = new_state.operation_number;
+
+        // Execute previous committed operations by checking the log
+        for commit_number in (self.commit_number + 1)..=new_state.commit_number {
+            let Some(operation) = self.log.get_operation(commit_number) else {
+                // Log state is incorrect. Intermediate operations are missing
+                return Err(ReplicaError::InvalidState);
+            };
+
+            self.service.execute(operation);
+        }
         self.commit_number = new_state.commit_number;
         self.committed_at = Instant::now();
 
@@ -679,12 +688,12 @@ where
     }
 
     fn since(&self, operation_number: usize) -> Log<I> {
-        if self.entries.len() >= operation_number {
+        if operation_number >= self.entries.len() {
             return Log::new();
         }
 
         let mut entries = Vec::new();
-        for i in operation_number..self.entries.len() {
+        for i in operation_number..self.size() {
             let entry = self
                 .entries
                 .get(i)
@@ -730,6 +739,7 @@ enum ReplicaStatus {
     Recovering,
 }
 
+#[derive(Debug, PartialEq)]
 enum PrepareAck {
     Waiting { replicas: HashSet<usize> },
     Executed,
@@ -783,8 +793,11 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap};
 
     use crate::{
-        network::{Message, Network, PrepareMessage, ReplyMessage, RequestMessage},
-        replica::{ClientTableEntry, Log, ReplicaError},
+        network::{
+            CommitMessage, GetStateMessage, Message, Network, NewStateMessage, PrepareMessage,
+            PrepareOkMessage, ReplyMessage, RequestMessage,
+        },
+        replica::{ClientTableEntry, Log, LogEntry, PrepareAck, ReplicaError},
     };
 
     use super::{Replica, Service};
@@ -850,12 +863,24 @@ mod tests {
         }
     }
 
-    fn create_replica(total: usize) -> Replica<MockService, MockNetwork, usize, usize> {
+    fn create_primary(total: usize) -> Replica<MockService, MockNetwork, usize, usize> {
+        create_replica(0, total)
+    }
+
+    fn create_backup(total: usize) -> Replica<MockService, MockNetwork, usize, usize> {
+        create_replica(1, total)
+    }
+
+    fn create_replica(
+        replica_number: usize,
+        total: usize,
+    ) -> Replica<MockService, MockNetwork, usize, usize> {
         assert!(total > 0);
 
-        let connected = (1..total).collect::<Vec<usize>>();
+        let connected = (0..total)
+            .filter(|i| i != &replica_number)
+            .collect::<Vec<usize>>();
 
-        let replica_number = 0;
         let service = MockService;
         let network = MockNetwork::new(connected);
 
@@ -863,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_request_message() {
+    fn handles_request() {
         // given
         let request = Message::Request(RequestMessage {
             view: 0,
@@ -871,7 +896,7 @@ mod tests {
             client_id: 1,
             operation: 0,
         });
-        let mut replica = create_replica(3);
+        let mut replica = create_primary(3);
 
         // when
         let result = replica.handle_message(request.clone());
@@ -879,31 +904,12 @@ mod tests {
         // then
         assert_eq!(result, Ok(()));
 
-        let prepare = Message::Prepare(PrepareMessage {
-            view: 0,
-            operation_number: 1,
-            commit_number: 0,
-            request: RequestMessage {
-                view: 0,
-                request_number: 1,
-                client_id: 1,
-                operation: 0,
-            },
-        });
-
         // state is correct
         assert_eq!(replica.replica_number, 0);
         assert_eq!(replica.view, 0);
         assert_eq!(replica.total, 3);
         assert_eq!(replica.operation_number, 1);
         assert_eq!(replica.commit_number, 0);
-
-        // prepare messages are sent
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(1, prepare.clone()), (2, prepare.clone())])
-        );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
 
         // log is correct
         let mut log = Log::new();
@@ -920,10 +926,64 @@ mod tests {
             },
         );
         assert_eq!(replica.client_table, client_table);
+
+        // prepare messages are sent
+        let prepare = Message::Prepare(PrepareMessage {
+            view: 0,
+            operation_number: 1,
+            commit_number: 0,
+            request: RequestMessage {
+                view: 0,
+                request_number: 1,
+                client_id: 1,
+                operation: 0,
+            },
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(1, prepare.clone()), (2, prepare.clone())])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
-    fn backup_replica_ignores_requests() {
+    fn handles_request_returns_most_recent_response() {
+        // given
+        let request = Message::Request(RequestMessage {
+            view: 0,
+            request_number: 1,
+            client_id: 1,
+            operation: 0,
+        });
+        let mut replica = create_primary(3);
+        replica.client_table = HashMap::from_iter([(
+            1,
+            ClientTableEntry {
+                request_number: 1,
+                response: Some(1),
+            },
+        )]);
+
+        // when
+        let result = replica.handle_message(request.clone());
+
+        // then
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *replica.network.outgoing.borrow(),
+            HashMap::from_iter([(
+                1,
+                ReplyMessage {
+                    view: 0,
+                    request_number: 1,
+                    result: 1
+                }
+            )])
+        );
+    }
+
+    #[test]
+    fn handles_request_backup_replica_ignores() {
         // given
         let request = Message::Request(RequestMessage {
             view: 1,
@@ -931,11 +991,10 @@ mod tests {
             client_id: 1,
             operation: 0,
         });
-        let mut replica = create_replica(3);
-        replica.view = 1;
+        let mut replica = create_backup(3);
 
         // when
-        let result = replica.handle_message(request.clone());
+        let result = replica.handle_message(request);
 
         // then
         assert_eq!(result, Ok(()));
@@ -944,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_invalid_view_sent_by_client() {
+    fn handles_request_invalid_view_sent_by_client() {
         // given
         let request = Message::Request(RequestMessage {
             view: 1,
@@ -952,12 +1011,365 @@ mod tests {
             client_id: 1,
             operation: 0,
         });
-        let mut replica = create_replica(3);
+        let mut replica = create_primary(3);
 
         // when
         let result = replica.handle_message(request.clone());
 
         // then
         assert_eq!(result, Err(ReplicaError::MessageViewMismatch));
+    }
+
+    #[test]
+    fn handles_prepare() {
+        // given
+        let prepare = Message::Prepare(PrepareMessage {
+            view: 0,
+            operation_number: 1,
+            commit_number: 0,
+            request: RequestMessage {
+                view: 0,
+                request_number: 1,
+                client_id: 1,
+                operation: 0,
+            },
+        });
+        let mut replica = create_backup(3);
+
+        // when
+        let result = replica.handle_message(prepare);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.operation_number, 1);
+        assert_eq!(replica.commit_number, 0);
+
+        // log is correct
+        let mut log = Log::new();
+        log.append(0, 1, 1);
+        assert_eq!(replica.log, log);
+
+        // client table is correct
+        let mut client_table = HashMap::new();
+        client_table.insert(
+            1,
+            ClientTableEntry {
+                request_number: 1,
+                response: None,
+            },
+        );
+        assert_eq!(replica.client_table, client_table);
+
+        // prepare_ok messages are sent
+        let prepare_ok = Message::PrepareOk(PrepareOkMessage {
+            view: 0,
+            operation_number: 1,
+            replica_number: 1,
+            client_id: 1,
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(0, prepare_ok)])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_prepare_triggers_state_transfer() {
+        // given
+        let prepare = Message::Prepare(PrepareMessage {
+            view: 0,
+            operation_number: 2,
+            commit_number: 1,
+            request: RequestMessage {
+                view: 0,
+                request_number: 2,
+                client_id: 1,
+                operation: 1,
+            },
+        });
+        let mut replica = create_backup(3);
+        replica.log.append(0, 1, 1);
+
+        // when
+        let result = replica.handle_message(prepare);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // get_state message sent
+        let get_state = Message::GetState(GetStateMessage {
+            view: 0,
+            operation_number: 0,
+            replica_number: 1,
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(2, get_state)])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_prepare_ok() {
+        // given
+        let prepare_ok = Message::PrepareOk(PrepareOkMessage {
+            view: 0,
+            operation_number: 1,
+            replica_number: 1,
+            client_id: 1,
+        });
+        let mut replica = create_primary(3);
+        let operation = 0;
+        replica.log.append(operation, 1, 1);
+        replica.client_table.insert(
+            1,
+            ClientTableEntry {
+                request_number: 1,
+                response: None,
+            },
+        );
+        replica.prepare_acks.insert(
+            1,
+            PrepareAck::Waiting {
+                replicas: [2].into(),
+            },
+        );
+
+        // when
+        let result = replica.handle_message(prepare_ok);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.commit_number, 1);
+        assert_eq!(
+            replica.prepare_acks,
+            HashMap::from_iter([(1, PrepareAck::Executed)])
+        );
+
+        // client table is correct
+        let mut client_table = HashMap::new();
+        client_table.insert(
+            1,
+            ClientTableEntry {
+                request_number: 1,
+                response: Some(MockService.execute(&operation)),
+            },
+        );
+        assert_eq!(replica.client_table, client_table);
+
+        // client response sent
+        let reply_message = ReplyMessage {
+            view: 0,
+            request_number: 1,
+            result: MockService.execute(&operation),
+        };
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(
+            *replica.network.outgoing.borrow(),
+            HashMap::from_iter([(1, reply_message)])
+        );
+    }
+
+    #[test]
+    fn handles_prepare_ok_waits_for_acks() {
+        // given
+        let prepare_ok = Message::PrepareOk(PrepareOkMessage {
+            view: 0,
+            operation_number: 1,
+            replica_number: 1,
+            client_id: 1,
+        });
+        let mut replica = create_primary(5);
+        let operation = 0;
+        replica.log.append(operation, 1, 1);
+        replica.client_table.insert(
+            1,
+            ClientTableEntry {
+                request_number: 1,
+                response: None,
+            },
+        );
+
+        // when
+        let result = replica.handle_message(prepare_ok);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(
+            replica.prepare_acks,
+            HashMap::from_iter([(
+                1,
+                PrepareAck::Waiting {
+                    replicas: [1].into()
+                }
+            )])
+        );
+
+        // no message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_commit() {
+        // given
+        let commit = Message::Commit(CommitMessage {
+            view: 0,
+            operation_number: 2,
+        });
+        let mut replica = create_backup(3);
+        replica.operation_number = 2;
+        replica.commit_number = 0;
+        replica.log.append(0, 1, 1);
+        replica.log.append(1, 2, 1);
+
+        // when
+        let result = replica.handle_message(commit);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.commit_number, 2);
+
+        // no message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_commit_trigger_state_transfer() {
+        // given
+        let commit = Message::Commit(CommitMessage {
+            view: 0,
+            operation_number: 2,
+        });
+        let mut replica = create_backup(3);
+        replica.operation_number = 0;
+        replica.commit_number = 0;
+
+        // when
+        let result = replica.handle_message(commit);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.commit_number, 0);
+
+        // get_state message sent
+        let get_state = Message::GetState(GetStateMessage {
+            view: 0,
+            operation_number: 0,
+            replica_number: 1,
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(2, get_state)])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_get_state() {
+        // given
+        let get_state = Message::GetState(GetStateMessage {
+            view: 0,
+            operation_number: 1,
+            replica_number: 2,
+        });
+        let mut replica = create_backup(3);
+        replica.operation_number = 3;
+        replica.commit_number = 2;
+        replica.log.append(0, 1, 1);
+        replica.log.append(1, 2, 1);
+        replica.log.append(2, 3, 1);
+
+        // when
+        let result = replica.handle_message(get_state);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // new_state message sent
+        let new_state = Message::NewState(NewStateMessage {
+            view: 0,
+            log_after_operation: Log {
+                entries: Vec::from([
+                    LogEntry {
+                        request_number: 2,
+                        client_id: 1,
+                        operation: 1,
+                    },
+                    LogEntry {
+                        request_number: 3,
+                        client_id: 1,
+                        operation: 2,
+                    },
+                ]),
+            },
+            operation_number: 3,
+            commit_number: 2,
+        });
+        assert_eq!(
+            *replica.network.incoming.borrow(),
+            HashMap::from_iter([(2, new_state)])
+        );
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+    }
+
+    #[test]
+    fn handles_new_state() {
+        // given
+        let new_state = Message::NewState(NewStateMessage {
+            view: 0,
+            log_after_operation: Log {
+                entries: Vec::from([
+                    LogEntry {
+                        request_number: 2,
+                        client_id: 1,
+                        operation: 1,
+                    },
+                    LogEntry {
+                        request_number: 3,
+                        client_id: 1,
+                        operation: 2,
+                    },
+                ]),
+            },
+            operation_number: 3,
+            commit_number: 2,
+        });
+        let mut replica = create_backup(3);
+        replica.log.append(0, 1, 1);
+        replica.operation_number = 1;
+
+        // when
+        let result = replica.handle_message(new_state);
+
+        // then
+        assert_eq!(result, Ok(()));
+
+        // state is correct
+        assert_eq!(replica.operation_number, 3);
+        assert_eq!(replica.commit_number, 2);
+
+        // log is correct
+        let mut log = Log::new();
+        log.append(0, 1, 1);
+        log.append(1, 2, 1);
+        log.append(2, 3, 1);
+        assert_eq!(replica.log, log);
+
+        // new_state message sent
+        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
+        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 }
