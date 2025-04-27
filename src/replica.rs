@@ -23,19 +23,19 @@ const IDLE_TIMEOUT_MS: Duration = Duration::from_millis(2000);
 
 /// A single replica
 pub struct Replica<S, N, I, O> {
-    /// The current replica number given the configuration
+    /// The current replica number given the configuration.
     replica_number: usize,
 
-    /// Internal view number of the replica
+    /// Internal view number of the replica.
     pub(crate) view: usize,
 
-    /// The total amount of replicas
+    /// The total amount of replicas.
     total: usize,
 
-    /// Internal replica state to understand availability
+    /// Internal replica state to understand availability.
     status: ReplicaStatus,
 
-    /// Most recently received request, initially 0
+    /// Most recently received request, initially 0.
     operation_number: usize,
 
     /// Acknowledgements table with the operations that have been acknowledged by
@@ -45,16 +45,17 @@ pub struct Replica<S, N, I, O> {
     prepare_acks: HashMap<usize, PrepareAck>,
 
     /// Heap with the view change acknowledgements sorted by latest view and
-    /// operation number
+    /// operation number.
     view_acks: BinaryHeap<ViewAck<I>>,
 
+    /// An unsorted set of recovery acknowledgements coming from other replicas.
     recovery_acks: Vec<RecoveryAck<I>>,
 
     /// Log entries of size "operation_number" containing the requests
     /// that have been received so far in their assigned order.
     log: Log<I>,
 
-    /// The operation number of the most recently committed operation
+    /// The operation number of the most recently committed operation.
     commit_number: usize,
 
     /// The timestamp of the last committed operation.
@@ -68,7 +69,7 @@ pub struct Replica<S, N, I, O> {
     service: S,
 
     /// Network of the replica containing connections to all the replicas
-    /// and the client
+    /// and the client.
     pub(crate) network: N,
 }
 
@@ -116,7 +117,7 @@ where
         }
     }
 
-    fn handle_message(&mut self, message: Message<I>) -> Result<(), ReplicaError> {
+    fn handle_message(&mut self, message: Message<I>) -> Result<HandleOutput<I, O>, ReplicaError> {
         match message {
             Message::Request(request) => self.handle_request(request),
             Message::Prepare(prepare) => self.handle_prepare(prepare),
@@ -136,10 +137,13 @@ where
         }
     }
 
-    fn handle_request(&mut self, request: RequestMessage<I>) -> Result<(), ReplicaError> {
+    fn handle_request(
+        &mut self,
+        request: RequestMessage<I>,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         // Backup replicas ignore client request message.
         if !self.is_primary() {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         }
 
         // The replica and message should message
@@ -157,7 +161,7 @@ where
         // client and it has already been executed.
         if let Some(most_recent_request) = self.client_table.get(&request.client_id) {
             if most_recent_request.request_number > request.request_number {
-                return Ok(());
+                return Ok(HandleOutput::DoNothing);
             }
 
             if most_recent_request.request_number == request.request_number {
@@ -167,7 +171,7 @@ where
                         request_number: most_recent_request.request_number,
                         result: result.clone(),
                     };
-                    return self.network.send_client(message, request.client_id);
+                    return Ok(HandleOutput::send_client(message, request.client_id));
                 }
             }
         }
@@ -191,15 +195,18 @@ where
         );
 
         // Broadcast message to the backup replicas
-        self.network.broadcast(Message::Prepare(PrepareMessage {
+        Ok(HandleOutput::broadcast(Message::Prepare(PrepareMessage {
             view: request.view,
             operation_number: self.operation_number,
             commit_number: self.commit_number,
             request,
-        }))
+        })))
     }
 
-    fn handle_prepare(&mut self, prepare: PrepareMessage<I>) -> Result<(), ReplicaError> {
+    fn handle_prepare(
+        &mut self,
+        prepare: PrepareMessage<I>,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         // `Prepare` messages must only be received by backup replicas
         assert!(!self.is_primary());
 
@@ -210,7 +217,7 @@ where
 
         // The operation has already been processed by the replica. The message is duplicate and will be ignored.
         if self.operation_number + 1 > prepare.operation_number {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         }
 
         // Replica is missing some operations, we should initiate state transfer
@@ -250,18 +257,21 @@ where
         self.committed_at = Instant::now();
 
         // Send a prepare ok message to the primary
-        self.network.send(
+        Ok(HandleOutput::send(
             Message::PrepareOk(PrepareOkMessage {
                 view: prepare.view,
                 operation_number: prepare.operation_number,
                 replica_number: self.replica_number,
                 client_id: prepare.request.client_id,
             }),
-            &self.view,
-        )
+            self.view,
+        ))
     }
 
-    fn handle_prepare_ok(&mut self, prepare_ok: PrepareOkMessage) -> Result<(), ReplicaError> {
+    fn handle_prepare_ok(
+        &mut self,
+        prepare_ok: PrepareOkMessage,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         // `PrepareOk` messages must only be received by the primary
         assert!(self.is_primary());
 
@@ -281,14 +291,14 @@ where
 
         let ack_replicas = match ack {
             PrepareAck::Waiting { replicas } => replicas,
-            PrepareAck::Executed => return Ok(()),
+            PrepareAck::Executed => return Ok(HandleOutput::DoNothing),
         };
 
         ack_replicas.insert(prepare_ok.replica_number);
 
         // Quorum not reached yet. Primary waits for more `PrepareOk` messages
         if ack_replicas.len() < quorum(self.total) {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         };
 
         // Execute the query
@@ -298,7 +308,7 @@ where
             .expect("Operation not found in log");
 
         let Some(result) = self.execute_operation(operation)? else {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         };
 
         // Increment commit_number
@@ -311,26 +321,24 @@ where
         let client_request = self.client_table.get_mut(&prepare_ok.client_id)
             .expect("Client must be present in the client table since the request message has been already received");
 
+        // The primary also updates the client's entry in the client-table to contain the result
+        client_request.response = Some(result.clone());
+
         // Send reply message to the client
-        self.network.send_client(
+        Ok(HandleOutput::send_client(
             ReplyMessage {
                 view: prepare_ok.view,
                 request_number: client_request.request_number,
-                result: result.clone(),
+                result,
             },
             prepare_ok.client_id,
-        )?;
-
-        // The primary also updates the client's entry in the client-table to contain the result
-        client_request.response = Some(result);
-
-        Ok(())
+        ))
     }
 
-    fn handle_commit(&mut self, commit: CommitMessage) -> Result<(), ReplicaError> {
+    fn handle_commit(&mut self, commit: CommitMessage) -> Result<HandleOutput<I, O>, ReplicaError> {
         // Replica is not prepared to handle operations, the commit message is ignored.
         if self.status != ReplicaStatus::Normal {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         }
 
         // `Commit` messages must only be received by backup replicas
@@ -346,7 +354,7 @@ where
         // to execute.
         if self.commit_number >= commit.operation_number {
             self.committed_at = Instant::now();
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         }
 
         let has_log = self.log.get_operation(commit.operation_number).is_some();
@@ -367,10 +375,10 @@ where
         self.commit_number = commit.operation_number;
         self.committed_at = Instant::now();
 
-        Ok(())
+        Ok(HandleOutput::DoNothing)
     }
 
-    fn trigger_state_transfer(&self) -> Result<(), ReplicaError> {
+    fn trigger_state_transfer(&self) -> Result<HandleOutput<I, O>, ReplicaError> {
         let message = Message::GetState(GetStateMessage {
             view: self.view,
             operation_number: self.operation_number,
@@ -379,10 +387,13 @@ where
 
         // Send message to the next replica in the circle
         let next_replica = self.next_replica(self.replica_number);
-        self.network.send(message, &next_replica)
+        Ok(HandleOutput::send(message, next_replica))
     }
 
-    fn handle_get_state(&mut self, get_state: GetStateMessage) -> Result<(), ReplicaError> {
+    fn handle_get_state(
+        &mut self,
+        get_state: GetStateMessage,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         assert!(self.status == ReplicaStatus::Normal);
         assert!(self.view == get_state.view);
 
@@ -395,10 +406,13 @@ where
             commit_number: self.commit_number,
         });
 
-        self.network.send(message, &get_state.replica_number)
+        Ok(HandleOutput::send(message, get_state.replica_number))
     }
 
-    fn handle_new_state(&mut self, new_state: NewStateMessage<I>) -> Result<(), ReplicaError> {
+    fn handle_new_state(
+        &mut self,
+        new_state: NewStateMessage<I>,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         assert!(self.view == new_state.view);
 
         self.log.merge(new_state.log_after_operation);
@@ -416,13 +430,13 @@ where
         self.commit_number = new_state.commit_number;
         self.committed_at = Instant::now();
 
-        Ok(())
+        Ok(HandleOutput::DoNothing)
     }
 
     fn handle_start_view_change(
         &mut self,
         start_view_change: StartViewChangeMessage,
-    ) -> Result<(), ReplicaError> {
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         let old_view = self.view;
 
         // New backup replica acknowledges a view change and waits for the new primary
@@ -441,7 +455,7 @@ where
                 commit_number: self.commit_number,
                 log: self.log.clone(),
             });
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         }
 
         // Send a `DoViewChange` to the new primary replica to mark the current replica
@@ -455,13 +469,13 @@ where
             replica_number: self.replica_number,
         });
 
-        self.network.send(message, &self.view)
+        Ok(HandleOutput::send(message, self.view))
     }
 
     fn handle_do_view_change(
         &mut self,
         do_view_change: DoViewChangeMessage<I>,
-    ) -> Result<(), ReplicaError> {
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         // When the primary received `quorum + 1` `DoViewChange` messages from different replicas
         // (including itself), it sets its view number to that in the messages as selects as the
         // new log the one contained in the message with the largest view.
@@ -473,7 +487,7 @@ where
         });
 
         if self.view_acks.len() < quorum(self.total) {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         }
 
         if self.view != do_view_change.new_view {
@@ -490,29 +504,31 @@ where
         self.log = new_view.log;
         self.operation_number = new_view.operation_number;
 
+        let mut actions = Vec::new();
+
         // In case any uncommitted operations are present
         if self.operation_number > self.commit_number {
             let mut executed_requests = HashMap::new();
 
             // Iterate over all the uncommitted operations in the log in order
-            for operation_number in new_view.commit_number..=self.operation_number {
+            for operation_number in (new_view.commit_number + 1)..=self.operation_number {
                 let log_entry = self.log.get_entry(operation_number).expect(
                     "Log entry must be present if the operation number is higher than the log size",
                 );
 
                 // Execute the operation and send reply to the client
                 let Some(result) = self.execute_operation(&log_entry.operation)? else {
-                    return Ok(());
+                    return Ok(HandleOutput::DoNothing);
                 };
 
-                self.network.send_client(
-                    ReplyMessage {
+                actions.push(OutputAction::SendClient {
+                    message: ReplyMessage {
                         view: self.view,
                         request_number: log_entry.request_number,
                         result: result.clone(),
                     },
-                    log_entry.client_id,
-                )?;
+                    client_id: log_entry.client_id,
+                });
 
                 executed_requests.insert(
                     log_entry.client_id,
@@ -539,40 +555,45 @@ where
             commit_number: self.commit_number,
         });
 
-        self.network.broadcast(message)?;
+        actions.push(OutputAction::Broadcast { message });
 
-        Ok(())
+        Ok(HandleOutput::Actions(actions))
     }
 
-    fn handle_start_view(&mut self, start_view: StartViewMessage<I>) -> Result<(), ReplicaError> {
+    fn handle_start_view(
+        &mut self,
+        start_view: StartViewMessage<I>,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         // Refresh internal state with the new view
         self.status = ReplicaStatus::Normal;
         self.view = start_view.view;
         self.log = start_view.log;
         self.operation_number = start_view.operation_number;
 
+        let mut actions = Vec::new();
+
         // Iterate over all the uncommitted operations in the log in order
         if self.operation_number > self.commit_number {
             let mut executed_requests = HashMap::new();
-            for operation_number in start_view.commit_number..=self.operation_number {
+            for operation_number in (start_view.commit_number + 1)..=self.operation_number {
                 let log_entry = self.log.get_entry(operation_number).expect(
                     "Log entry must be present if the operation number is higher than the log size",
                 );
 
                 // Execute the operation and send a `PrepareOk` to the new primary
                 let Some(result) = self.execute_operation(&log_entry.operation)? else {
-                    return Ok(());
+                    return Ok(HandleOutput::DoNothing);
                 };
 
-                self.network.send(
-                    Message::PrepareOk(PrepareOkMessage {
+                actions.push(OutputAction::Send {
+                    message: Message::PrepareOk(PrepareOkMessage {
                         view: self.view,
                         operation_number,
                         replica_number: self.replica_number,
                         client_id: log_entry.client_id,
                     }),
-                    &self.view,
-                )?;
+                    replica: self.view,
+                });
 
                 executed_requests.insert(
                     log_entry.client_id,
@@ -590,10 +611,13 @@ where
         self.commit_number = start_view.commit_number;
         self.committed_at = Instant::now();
 
-        Ok(())
+        Ok(HandleOutput::Actions(actions))
     }
 
-    fn handle_recovery(&mut self, recovery: RecoveryMessage) -> Result<(), ReplicaError> {
+    fn handle_recovery(
+        &mut self,
+        recovery: RecoveryMessage,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         // A replica won't respond to a recovery if it's not operational
         assert!(self.status == ReplicaStatus::Normal);
 
@@ -615,16 +639,16 @@ where
             }
         };
 
-        self.network.send(
+        Ok(HandleOutput::send(
             Message::RecoveryResponse(response),
-            &recovery.replica_number,
-        )
+            recovery.replica_number,
+        ))
     }
 
     fn handle_recovery_response(
         &mut self,
         recovery_response: RecoveryResponseMessage<I>,
-    ) -> Result<(), ReplicaError> {
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         match self.status {
             ReplicaStatus::Recovering { nonce } => assert!(nonce == recovery_response.nonce),
             _ => panic!("Replica must be in recovering status to handle recovery responses"),
@@ -635,7 +659,7 @@ where
             .push(RecoveryAck::from_message(recovery_response));
 
         if self.recovery_acks.len() < (quorum(self.total) + 1) {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         };
 
         // Read the primary acknowledgements of the latest view. If no acknowledgement from the
@@ -663,7 +687,7 @@ where
             view,
         }) = ready_ack
         else {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         };
 
         self.view = *view;
@@ -680,7 +704,7 @@ where
             };
 
             let Some(result) = self.execute_operation(&log_entry.operation)? else {
-                return Ok(());
+                return Ok(HandleOutput::DoNothing);
             };
 
             executed_requests.insert(
@@ -703,41 +727,47 @@ where
         // Clear acks
         self.recovery_acks.clear();
 
-        Ok(())
+        Ok(HandleOutput::DoNothing)
     }
 
-    fn periodic(&mut self) -> Result<(), ReplicaError> {
+    fn periodic(&mut self) -> Result<HandleOutput<I, O>, ReplicaError> {
         // Primary periodic tasks
         if self.is_primary() {
             // If the primary is idle (no requests sent)
             if self.committed_at.elapsed() >= COMMIT_TIMEOUT_MS {
-                self.trigger_commit(self.view, self.operation_number)?;
+                return self.trigger_commit(self.view, self.operation_number);
             }
         } else {
             // If the backup is idle (no requests received)
             if self.committed_at.elapsed() >= IDLE_TIMEOUT_MS {
-                self.trigger_view_change()?;
+                return self.trigger_view_change();
             }
         }
 
-        Ok(())
+        Ok(HandleOutput::DoNothing)
     }
 
-    fn trigger_commit(&self, view: usize, operation_number: usize) -> Result<(), ReplicaError> {
+    fn trigger_commit(
+        &self,
+        view: usize,
+        operation_number: usize,
+    ) -> Result<HandleOutput<I, O>, ReplicaError> {
         // `Commit` messages must only be received by the primary
         assert!(self.replica_number == view);
 
-        self.network.broadcast(Message::Commit(CommitMessage {
+        let message = Message::Commit(CommitMessage {
             view,
             operation_number,
-        }))
+        });
+
+        Ok(HandleOutput::broadcast(message))
     }
 
-    fn trigger_view_change(&mut self) -> Result<(), ReplicaError> {
+    fn trigger_view_change(&mut self) -> Result<HandleOutput<I, O>, ReplicaError> {
         // If the replica is not running a view change already, or it's in recovery
         // we won't start a new change.
         if self.status != ReplicaStatus::Normal {
-            return Ok(());
+            return Ok(HandleOutput::DoNothing);
         }
 
         self.view = self.next_replica(self.view);
@@ -748,10 +778,10 @@ where
             replica_number: self.replica_number,
         });
 
-        self.network.broadcast(message)
+        Ok(HandleOutput::broadcast(message))
     }
 
-    fn trigger_recovery(&mut self) -> Result<(), ReplicaError> {
+    fn trigger_recovery(&mut self) -> Result<HandleOutput<I, O>, ReplicaError> {
         let nonce = nonce();
         self.status = ReplicaStatus::Recovering { nonce };
 
@@ -760,7 +790,7 @@ where
             nonce,
         });
 
-        self.network.broadcast(message)
+        Ok(HandleOutput::broadcast(message))
     }
 
     fn is_primary(&self) -> bool {
@@ -782,7 +812,7 @@ where
         let ticker = tick(PERIODIC_INTERVAL);
 
         loop {
-            let Some(err) = select! {
+            let result = select! {
                 recv(self.network.client.incoming.1) -> message => message
                     .map_err(|_| ReplicaError::IO(IOError::Recv))
                     .and_then(|message| self.handle_message(Message::Request(message))),
@@ -791,33 +821,89 @@ where
                     .and_then(|message| self.handle_message(message)),
                 recv(ticker) -> _ => self.periodic()
             }
-            .err() else {
-                continue;
-            };
+            .and_then(|outputs| self.handle_output(outputs));
 
-            tracing::error!(
-                "Error while handling message in replica {}: {}",
-                self.replica_number,
-                err
-            );
-
-            match err {
-                ReplicaError::Network
-                | ReplicaError::NotReady
-                | ReplicaError::MessageViewMismatch
-                | ReplicaError::IO(_) => {
-                    tracing::warn!(
-                        "Error is not critical. Replica {} ignores message",
-                        self.replica_number
-                    );
-                    continue;
-                }
-                ReplicaError::InvalidState | ReplicaError::ServiceExecution => self
-                    .trigger_recovery()
-                    .expect("Replica can't be recovered. Replica is shutting down..."),
+            match result {
+                Ok(_) => continue,
+                Err(err) => self.handle_err(err),
             }
         }
     }
+
+    fn handle_output(&self, output: HandleOutput<I, O>) -> Result<(), ReplicaError> {
+        match output {
+            HandleOutput::DoNothing => Ok(()),
+            HandleOutput::Actions(actions) => {
+                for action in actions {
+                    match action {
+                        OutputAction::Broadcast { message } => self.network.broadcast(message)?,
+                        OutputAction::Send { message, replica } => {
+                            self.network.send(message, &replica)?
+                        }
+                        OutputAction::SendClient { message, client_id } => {
+                            self.network.send_client(message, client_id)?
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_err(&mut self, err: ReplicaError) {
+        match err {
+            ReplicaError::Network
+            | ReplicaError::NotReady
+            | ReplicaError::MessageViewMismatch
+            | ReplicaError::IO(_) => {
+                tracing::warn!(
+                    "Error is not critical. Replica {} ignores message",
+                    self.replica_number
+                );
+            }
+            ReplicaError::InvalidState | ReplicaError::ServiceExecution => {
+                self.trigger_recovery()
+                    .and_then(|output| self.handle_output(output))
+                    .unwrap_or_else(|err| self.handle_err(err));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum HandleOutput<I, O> {
+    Actions(Vec<OutputAction<I, O>>),
+    DoNothing,
+}
+
+impl<I, O> HandleOutput<I, O> {
+    fn broadcast(message: Message<I>) -> Self {
+        HandleOutput::Actions(vec![OutputAction::Broadcast { message }])
+    }
+
+    fn send(message: Message<I>, replica: usize) -> Self {
+        HandleOutput::Actions(vec![OutputAction::Send { message, replica }])
+    }
+
+    fn send_client(message: ReplyMessage<O>, client_id: usize) -> Self {
+        HandleOutput::Actions(vec![OutputAction::SendClient { message, client_id }])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OutputAction<I, O> {
+    Broadcast {
+        message: Message<I>,
+    },
+    Send {
+        message: Message<I>,
+        replica: usize,
+    },
+    SendClient {
+        message: ReplyMessage<O>,
+        client_id: usize,
+    },
 }
 
 pub(crate) fn quorum(total: usize) -> usize {
@@ -1026,8 +1112,8 @@ mod tests {
             StartViewMessage,
         },
         replica::{
-            ClientTableEntry, IDLE_TIMEOUT_MS, Log, LogEntry, PrepareAck, RecoveryAck,
-            RecoveryPrimaryAck, ReplicaError, ReplicaStatus, ViewAck,
+            ClientTableEntry, HandleOutput, IDLE_TIMEOUT_MS, Log, LogEntry, OutputAction,
+            PrepareAck, RecoveryAck, RecoveryPrimaryAck, ReplicaError, ReplicaStatus, ViewAck,
         },
     };
 
@@ -1151,7 +1237,20 @@ mod tests {
         let result = replica.handle_message(request.clone());
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::broadcast(Message::Prepare(PrepareMessage {
+                view: 0,
+                operation_number: 1,
+                commit_number: 0,
+                request: RequestMessage {
+                    view: 0,
+                    request_number: 1,
+                    client_id: 1,
+                    operation: 0,
+                },
+            })))
+        );
 
         // state is correct
         assert_eq!(replica.replica_number, 0);
@@ -1175,24 +1274,6 @@ mod tests {
             },
         );
         assert_eq!(replica.client_table, client_table);
-
-        // prepare messages are sent
-        let prepare = Message::Prepare(PrepareMessage {
-            view: 0,
-            operation_number: 1,
-            commit_number: 0,
-            request: RequestMessage {
-                view: 0,
-                request_number: 1,
-                client_id: 1,
-                operation: 0,
-            },
-        });
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(1, prepare.clone()), (2, prepare.clone())])
-        );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1217,17 +1298,16 @@ mod tests {
         let result = replica.handle_message(request.clone());
 
         // then
-        assert_eq!(result, Ok(()));
         assert_eq!(
-            *replica.network.outgoing.borrow(),
-            HashMap::from_iter([(
-                1,
+            result,
+            Ok(HandleOutput::send_client(
                 ReplyMessage {
                     view: 0,
                     request_number: 1,
                     result: 1
-                }
-            )])
+                },
+                1
+            ))
         );
     }
 
@@ -1246,9 +1326,7 @@ mod tests {
         let result = replica.handle_message(request);
 
         // then
-        assert_eq!(result, Ok(()));
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
     }
 
     #[test]
@@ -1289,7 +1367,18 @@ mod tests {
         let result = replica.handle_message(prepare);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::send(
+                Message::PrepareOk(PrepareOkMessage {
+                    view: 0,
+                    operation_number: 1,
+                    replica_number: 1,
+                    client_id: 1,
+                }),
+                0
+            ))
+        );
 
         // state is correct
         assert_eq!(replica.operation_number, 1);
@@ -1310,19 +1399,6 @@ mod tests {
             },
         );
         assert_eq!(replica.client_table, client_table);
-
-        // prepare_ok messages are sent
-        let prepare_ok = Message::PrepareOk(PrepareOkMessage {
-            view: 0,
-            operation_number: 1,
-            replica_number: 1,
-            client_id: 1,
-        });
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(0, prepare_ok)])
-        );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1346,19 +1422,17 @@ mod tests {
         let result = replica.handle_message(prepare);
 
         // then
-        assert_eq!(result, Ok(()));
-
-        // get_state message sent
-        let get_state = Message::GetState(GetStateMessage {
-            view: 0,
-            operation_number: 0,
-            replica_number: 1,
-        });
         assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(2, get_state)])
+            result,
+            Ok(HandleOutput::send(
+                Message::GetState(GetStateMessage {
+                    view: 0,
+                    operation_number: 0,
+                    replica_number: 1,
+                }),
+                2
+            ))
         );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1391,7 +1465,17 @@ mod tests {
         let result = replica.handle_message(prepare_ok);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::send_client(
+                ReplyMessage {
+                    view: 0,
+                    request_number: 1,
+                    result: MockService.execute(&operation).unwrap(),
+                },
+                1
+            ))
+        );
 
         // state is correct
         assert_eq!(replica.commit_number, 1);
@@ -1410,18 +1494,6 @@ mod tests {
             },
         );
         assert_eq!(replica.client_table, client_table);
-
-        // client response sent
-        let reply_message = ReplyMessage {
-            view: 0,
-            request_number: 1,
-            result: MockService.execute(&operation).unwrap(),
-        };
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(
-            *replica.network.outgoing.borrow(),
-            HashMap::from_iter([(1, reply_message)])
-        );
     }
 
     #[test]
@@ -1448,7 +1520,7 @@ mod tests {
         let result = replica.handle_message(prepare_ok);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(
@@ -1460,10 +1532,6 @@ mod tests {
                 }
             )])
         );
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1483,14 +1551,10 @@ mod tests {
         let result = replica.handle_message(commit);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(replica.commit_number, 2);
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1508,22 +1572,20 @@ mod tests {
         let result = replica.handle_message(commit);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::send(
+                Message::GetState(GetStateMessage {
+                    view: 0,
+                    operation_number: 0,
+                    replica_number: 1,
+                }),
+                2
+            ))
+        );
 
         // state is correct
         assert_eq!(replica.commit_number, 0);
-
-        // get_state message sent
-        let get_state = Message::GetState(GetStateMessage {
-            view: 0,
-            operation_number: 0,
-            replica_number: 1,
-        });
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(2, get_state)])
-        );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1545,33 +1607,31 @@ mod tests {
         let result = replica.handle_message(get_state);
 
         // then
-        assert_eq!(result, Ok(()));
-
-        // new_state message sent
-        let new_state = Message::NewState(NewStateMessage {
-            view: 0,
-            log_after_operation: Log {
-                entries: Vec::from([
-                    LogEntry {
-                        request_number: 2,
-                        client_id: 1,
-                        operation: 1,
-                    },
-                    LogEntry {
-                        request_number: 3,
-                        client_id: 1,
-                        operation: 2,
-                    },
-                ]),
-            },
-            operation_number: 3,
-            commit_number: 2,
-        });
         assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(2, new_state)])
+            result,
+            Ok(HandleOutput::send(
+                Message::NewState(NewStateMessage {
+                    view: 0,
+                    log_after_operation: Log {
+                        entries: Vec::from([
+                            LogEntry {
+                                request_number: 2,
+                                client_id: 1,
+                                operation: 1,
+                            },
+                            LogEntry {
+                                request_number: 3,
+                                client_id: 1,
+                                operation: 2,
+                            },
+                        ]),
+                    },
+                    operation_number: 3,
+                    commit_number: 2,
+                }),
+                2
+            ))
         );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1604,7 +1664,7 @@ mod tests {
         let result = replica.handle_message(new_state);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(replica.operation_number, 3);
@@ -1616,10 +1676,6 @@ mod tests {
         log.append(1, 2, 1);
         log.append(2, 3, 1);
         assert_eq!(replica.log, log);
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1632,24 +1688,18 @@ mod tests {
         let result = replica.periodic();
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::broadcast(Message::StartViewChange(
+                StartViewChangeMessage {
+                    new_view: 1,
+                    replica_number: 1,
+                }
+            )))
+        );
 
         // state is correct
         assert_eq!(replica.status, ReplicaStatus::ViewChange);
-
-        // start_view_change messages sent
-        let start_view_change = Message::StartViewChange(StartViewChangeMessage {
-            new_view: 1,
-            replica_number: 1,
-        });
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([
-                (0, start_view_change.clone()),
-                (2, start_view_change.clone())
-            ])
-        );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1664,14 +1714,10 @@ mod tests {
         let result = replica.periodic();
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(replica.status, ReplicaStatus::ViewChange);
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1689,32 +1735,30 @@ mod tests {
         let result = replica.handle_message(start_view_change);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::send(
+                Message::DoViewChange(DoViewChangeMessage {
+                    old_view: 0,
+                    new_view: 1,
+                    log: Log {
+                        entries: vec![LogEntry {
+                            request_number: 1,
+                            client_id: 1,
+                            operation: 0,
+                        }],
+                    },
+                    operation_number: 1,
+                    commit_number: 0,
+                    replica_number: 0,
+                }),
+                1
+            ))
+        );
 
         // state is correct
         assert_eq!(replica.view, 1);
         assert_eq!(replica.status, ReplicaStatus::ViewChange);
-
-        // do_view_change message sent
-        let do_view_change = Message::DoViewChange(DoViewChangeMessage {
-            old_view: 0,
-            new_view: 1,
-            log: Log {
-                entries: vec![LogEntry {
-                    request_number: 1,
-                    client_id: 1,
-                    operation: 0,
-                }],
-            },
-            operation_number: 1,
-            commit_number: 0,
-            replica_number: 0,
-        });
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(1, do_view_change)])
-        );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1733,7 +1777,7 @@ mod tests {
         let result = replica.handle_message(start_view_change);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(replica.view, 1);
@@ -1756,10 +1800,6 @@ mod tests {
                 },
             }]
         );
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1797,7 +1837,27 @@ mod tests {
         let result = replica.handle_message(do_view_change);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::Actions(vec![
+                OutputAction::SendClient {
+                    message: ReplyMessage {
+                        view: 1,
+                        request_number: 2,
+                        result: 2
+                    },
+                    client_id: 1
+                },
+                OutputAction::Broadcast {
+                    message: Message::StartView(StartViewMessage {
+                        view: 1,
+                        log: message_log.clone(),
+                        operation_number: 2,
+                        commit_number: 1,
+                    })
+                }
+            ]))
+        );
 
         // state is correct
         assert_eq!(replica.operation_number, 2);
@@ -1810,31 +1870,6 @@ mod tests {
                 ClientTableEntry {
                     request_number: 2,
                     response: Some(2)
-                }
-            )])
-        );
-
-        // start_view messages sent
-        let start_view = Message::StartView(StartViewMessage {
-            view: 1,
-            log: message_log,
-            operation_number: 2,
-            commit_number: 1,
-        });
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(0, start_view.clone()), (2, start_view.clone())])
-        );
-
-        // reply messages sent
-        assert_eq!(
-            *replica.network.outgoing.borrow(),
-            HashMap::from_iter([(
-                1,
-                ReplyMessage {
-                    view: 1,
-                    request_number: 2,
-                    result: 2
                 }
             )])
         );
@@ -1861,7 +1896,7 @@ mod tests {
         let result = replica.handle_message(do_view_change);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(
@@ -1873,10 +1908,6 @@ mod tests {
                 log: message_log.clone()
             }]
         );
-
-        // no messages sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1901,7 +1932,18 @@ mod tests {
         let result = replica.handle_message(start_view);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(HandleOutput::send(
+                Message::PrepareOk(PrepareOkMessage {
+                    view: 1,
+                    operation_number: 2,
+                    replica_number: 0,
+                    client_id: 1,
+                }),
+                1
+            ))
+        );
 
         // state is correct
         assert_eq!(replica.status, ReplicaStatus::Normal);
@@ -1919,21 +1961,6 @@ mod tests {
                 }
             )])
         );
-
-        // prepare_ok message is sent to new replica
-        assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(
-                1,
-                Message::PrepareOk(PrepareOkMessage {
-                    view: 1,
-                    operation_number: 2,
-                    replica_number: 0,
-                    client_id: 1,
-                })
-            )])
-        );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1945,29 +1972,22 @@ mod tests {
         let result = replica.trigger_recovery();
 
         // then
-        assert_eq!(result, Ok(()));
+        let HandleOutput::Actions(actions) = result.unwrap() else {
+            panic!("Unexpected handle output")
+        };
+        assert_eq!(actions.len(), 1);
+
+        let OutputAction::Broadcast { message } = actions.first().unwrap() else {
+            panic!("unexpected actions")
+        };
+
+        let Message::Recovery(RecoveryMessage { replica_number, .. }) = message else {
+            panic!("unexpected message")
+        };
+        assert_eq!(replica_number, &1);
 
         // state is correct
         assert!(matches!(replica.status, ReplicaStatus::Recovering { .. }));
-
-        // prepare_ok message is sent to new replica
-        let incoming_messages = replica.network.incoming.borrow();
-        assert_eq!(incoming_messages.len(), 2);
-
-        let Message::Recovery(RecoveryMessage { replica_number, .. }) =
-            incoming_messages.get(&0).unwrap()
-        else {
-            panic!("unexpected message")
-        };
-        assert_eq!(replica_number, &1);
-        let Message::Recovery(RecoveryMessage { replica_number, .. }) =
-            incoming_messages.get(&2).unwrap()
-        else {
-            panic!("unexpected message")
-        };
-        assert_eq!(replica_number, &1);
-
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -1988,13 +2008,9 @@ mod tests {
         let result = replica.handle_message(recovery);
 
         // then
-        assert_eq!(result, Ok(()));
-
-        // recovery_response message is sent to recovering replica
         assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(
-                1,
+            result,
+            Ok(HandleOutput::send(
                 Message::RecoveryResponse(RecoveryResponseMessage {
                     view: 0,
                     nonce: 1234,
@@ -2003,10 +2019,10 @@ mod tests {
                         operation_number: 2,
                         commit_number: 1
                     })
-                })
-            )])
+                }),
+                1
+            ))
         );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -2027,21 +2043,17 @@ mod tests {
         let result = replica.handle_message(recovery);
 
         // then
-        assert_eq!(result, Ok(()));
-
-        // recovery_response message is sent to recovering replica
         assert_eq!(
-            *replica.network.incoming.borrow(),
-            HashMap::from_iter([(
-                1,
+            result,
+            Ok(HandleOutput::send(
                 Message::RecoveryResponse(RecoveryResponseMessage {
                     view: 0,
                     nonce: 1234,
                     primary: None
-                })
-            )])
+                }),
+                1
+            ))
         );
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -2086,7 +2098,7 @@ mod tests {
         let result = replica.handle_message(recovery_response);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(replica.view, 2);
@@ -2104,10 +2116,6 @@ mod tests {
             )])
         );
         assert_eq!(replica.status, ReplicaStatus::Normal);
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -2133,7 +2141,7 @@ mod tests {
         let result = replica.handle_message(recovery_response);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(replica.operation_number, 0);
@@ -2149,10 +2157,6 @@ mod tests {
                 view: 2,
             }]
         );
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 
     #[test]
@@ -2178,7 +2182,7 @@ mod tests {
         let result = replica.handle_message(recovery_response);
 
         // then
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(HandleOutput::DoNothing));
 
         // state is correct
         assert_eq!(replica.operation_number, 0);
@@ -2195,9 +2199,5 @@ mod tests {
                 }
             ]
         );
-
-        // no message sent
-        assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
-        assert_eq!(*replica.network.outgoing.borrow(), HashMap::new());
     }
 }
