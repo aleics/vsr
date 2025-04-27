@@ -160,10 +160,10 @@ where
         client_id: usize,
     ) -> Result<(), ReplicaError> {
         let Some(sender) = self.outgoing.get(client_id) else {
-            return Err(ReplicaError::NetworkError);
+            return Err(ReplicaError::Network);
         };
 
-        sender.send(message).map_err(|_| ReplicaError::NetworkError)
+        sender.send(message).map_err(|_| ReplicaError::Network)
     }
 }
 
@@ -233,14 +233,14 @@ where
             .get(replica)
             .expect("Could not send message: replica not found in the network");
 
-        sender.send(message).map_err(|_| ReplicaError::NetworkError)
+        sender.send(message).map_err(|_| ReplicaError::Network)
     }
 
     fn broadcast(&self, message: Message<I>) -> Result<(), ReplicaError> {
         for sender in self.other.values() {
             sender
                 .send(message.clone())
-                .map_err(|_| ReplicaError::NetworkError)?;
+                .map_err(|_| ReplicaError::Network)?;
         }
         Ok(())
     }

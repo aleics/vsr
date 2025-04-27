@@ -2,8 +2,7 @@ use std::sync::Mutex;
 use std::thread::{self, sleep};
 use std::time::Duration;
 
-use vsr::replica::Service;
-use vsr::{Cluster, Config};
+use vsr::{Cluster, Config, Service, ServiceError};
 
 #[derive(Debug)]
 struct Counter {
@@ -14,14 +13,14 @@ impl Service for Counter {
     type Input = Operation;
     type Output = i32;
 
-    fn execute(&self, input: &Self::Input) -> Self::Output {
+    fn execute(&self, input: &Self::Input) -> Result<Self::Output, ServiceError> {
         let mut current_value = self.value.lock().unwrap();
         match input {
             Operation::AddOne => *current_value += 1,
             Operation::SubOne => *current_value -= 1,
         };
 
-        *current_value
+        Ok(*current_value)
     }
 }
 

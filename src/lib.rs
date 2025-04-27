@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use client::Client;
 use crossbeam::channel::unbounded;
 use network::{AttachedChannel, ClientConnection, Message, ReplicaNetwork};
-use replica::{Replica, Service, quorum};
+use replica::{Replica, quorum};
+use thiserror::Error;
 
 /* VSR (Viewstamped Replication Revisited)
 
@@ -136,4 +137,20 @@ impl Cluster {
 
         panic!("Primary could not be found")
     }
+}
+
+#[derive(Error, Debug, PartialEq, Clone)]
+#[non_exhaustive]
+pub enum ServiceError {
+    #[error("Unrecoverable error: {0}")]
+    Unrecoverable(String),
+    #[error("Recoverable error: {0}")]
+    Recoverable(String),
+}
+
+pub trait Service {
+    type Input;
+    type Output;
+
+    fn execute(&self, input: &Self::Input) -> Result<Self::Output, ServiceError>;
 }

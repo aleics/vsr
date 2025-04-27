@@ -8,7 +8,7 @@ use crossbeam::{channel::tick, select};
 use thiserror::Error;
 
 use crate::{
-    Message,
+    Message, Service, ServiceError,
     network::{
         CommitMessage, DoViewChangeMessage, GetStateMessage, Network, NewStateMessage,
         PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
@@ -16,13 +16,6 @@ use crate::{
         StartViewChangeMessage, StartViewMessage,
     },
 };
-
-pub trait Service {
-    type Input;
-    type Output;
-
-    fn execute(&self, input: &Self::Input) -> Self::Output;
-}
 
 const PERIODIC_INTERVAL: Duration = Duration::from_millis(20);
 const COMMIT_TIMEOUT_MS: Duration = Duration::from_millis(200);
@@ -102,6 +95,24 @@ where
             client_table: HashMap::default(),
             network,
             service,
+        }
+    }
+
+    fn execute_operation(&self, input: &I) -> Result<Option<O>, ReplicaError> {
+        let result = self.service.execute(input);
+
+        match result {
+            Ok(output) => Ok(Some(output)),
+            Err(err) => match err {
+                ServiceError::Unrecoverable(err) => {
+                    tracing::error!("{}", err);
+                    Err(ReplicaError::ServiceExecution)
+                }
+                ServiceError::Recoverable(err) => {
+                    tracing::warn!("{}", err);
+                    Ok(None)
+                }
+            },
         }
     }
 
@@ -232,8 +243,9 @@ where
                 return Err(ReplicaError::InvalidState);
             };
 
-            self.service.execute(operation);
+            self.execute_operation(operation)?;
         }
+
         self.commit_number = prepare.commit_number;
         self.committed_at = Instant::now();
 
@@ -285,7 +297,9 @@ where
             .get_operation(prepare_ok.operation_number)
             .expect("Operation not found in log");
 
-        let result = self.service.execute(operation);
+        let Some(result) = self.execute_operation(operation)? else {
+            return Ok(());
+        };
 
         // Increment commit_number
         self.commit_number += 1;
@@ -347,7 +361,7 @@ where
                 return Err(ReplicaError::InvalidState);
             };
 
-            self.service.execute(operation);
+            self.execute_operation(operation)?;
         }
 
         self.commit_number = commit.operation_number;
@@ -397,7 +411,7 @@ where
                 return Err(ReplicaError::InvalidState);
             };
 
-            self.service.execute(operation);
+            self.execute_operation(operation)?;
         }
         self.commit_number = new_state.commit_number;
         self.committed_at = Instant::now();
@@ -487,7 +501,9 @@ where
                 );
 
                 // Execute the operation and send reply to the client
-                let result = self.service.execute(&log_entry.operation);
+                let Some(result) = self.execute_operation(&log_entry.operation)? else {
+                    return Ok(());
+                };
 
                 self.network.send_client(
                     ReplyMessage {
@@ -544,7 +560,9 @@ where
                 );
 
                 // Execute the operation and send a `PrepareOk` to the new primary
-                let result = self.service.execute(&log_entry.operation);
+                let Some(result) = self.execute_operation(&log_entry.operation)? else {
+                    return Ok(());
+                };
 
                 self.network.send(
                     Message::PrepareOk(PrepareOkMessage {
@@ -661,7 +679,9 @@ where
                 return Err(ReplicaError::InvalidState);
             };
 
-            let result = self.service.execute(&log_entry.operation);
+            let Some(result) = self.execute_operation(&log_entry.operation)? else {
+                return Ok(());
+            };
 
             executed_requests.insert(
                 log_entry.client_id,
@@ -762,16 +782,39 @@ where
         let ticker = tick(PERIODIC_INTERVAL);
 
         loop {
-            select! {
-                recv(self.network.client.incoming.1) -> message => match message {
-                    Ok(message) => self.handle_message(Message::Request(message)).unwrap(),
-                    Err(_) => panic!("something went wrong")
-                },
-                recv(self.network.incoming) -> message => match message {
-                    Ok(message) => self.handle_message(message).unwrap(),
-                    Err(_) => panic!("something went wrong")
-                },
-                recv(ticker) -> _ => self.periodic().unwrap()
+            let Some(err) = select! {
+                recv(self.network.client.incoming.1) -> message => message
+                    .map_err(|_| ReplicaError::IO(IOError::Recv))
+                    .and_then(|message| self.handle_message(Message::Request(message))),
+                recv(self.network.incoming) -> message => message
+                    .map_err(|_| ReplicaError::IO(IOError::Recv))
+                    .and_then(|message| self.handle_message(message)),
+                recv(ticker) -> _ => self.periodic()
+            }
+            .err() else {
+                continue;
+            };
+
+            tracing::error!(
+                "Error while handling message in replica {}: {}",
+                self.replica_number,
+                err
+            );
+
+            match err {
+                ReplicaError::Network
+                | ReplicaError::NotReady
+                | ReplicaError::MessageViewMismatch
+                | ReplicaError::IO(_) => {
+                    tracing::warn!(
+                        "Error is not critical. Replica {} ignores message",
+                        self.replica_number
+                    );
+                    continue;
+                }
+                ReplicaError::InvalidState | ReplicaError::ServiceExecution => self
+                    .trigger_recovery()
+                    .expect("Replica can't be recovered. Replica is shutting down..."),
             }
         }
     }
@@ -947,14 +990,24 @@ struct RecoveryPrimaryAck<I> {
 
 #[derive(Error, Debug, PartialEq)]
 pub enum ReplicaError {
+    #[error(transparent)]
+    IO(#[from] IOError),
     #[error("A message could not be sent or received")]
-    NetworkError,
+    Network,
     #[error("A replica is not ready to receive requests")]
     NotReady,
     #[error("A replica has an invalid state")]
     InvalidState,
     #[error("View mismatch between client and replica")]
     MessageViewMismatch,
+    #[error("Service execution has failed")]
+    ServiceExecution,
+}
+
+#[derive(Error, Debug, PartialEq)]
+pub enum IOError {
+    #[error("Could not read from address")]
+    Recv,
 }
 
 #[cfg(test)]
@@ -978,7 +1031,7 @@ mod tests {
         },
     };
 
-    use super::{Replica, Service};
+    use super::{Replica, Service, ServiceError};
 
     struct MockNetwork {
         incoming: RefCell<HashMap<usize, Message<usize>>>,
@@ -1036,33 +1089,51 @@ mod tests {
         type Input = usize;
         type Output = usize;
 
-        fn execute(&self, input: &Self::Input) -> Self::Output {
-            input + 1
+        fn execute(&self, input: &Self::Input) -> Result<Self::Output, ServiceError> {
+            Ok(input + 1)
         }
     }
 
-    fn create_primary(total: usize) -> Replica<MockService, MockNetwork, usize, usize> {
-        create_replica(0, total)
-    }
-
-    fn create_backup(total: usize) -> Replica<MockService, MockNetwork, usize, usize> {
-        create_replica(1, total)
-    }
-
-    fn create_replica(
+    struct MockReplicaBuilder {
         replica_number: usize,
         total: usize,
-    ) -> Replica<MockService, MockNetwork, usize, usize> {
-        assert!(total > 0);
+    }
 
-        let connected = (0..total)
-            .filter(|i| i != &replica_number)
-            .collect::<Vec<usize>>();
+    impl MockReplicaBuilder {
+        fn new() -> Self {
+            MockReplicaBuilder::default()
+        }
 
-        let service = MockService;
-        let network = MockNetwork::new(connected);
+        fn backup(mut self) -> Self {
+            self.replica_number = 1;
+            self
+        }
 
-        Replica::new(replica_number, total, service, network)
+        fn total(mut self, total: usize) -> Self {
+            self.total = total;
+            self
+        }
+
+        fn build(self) -> Replica<MockService, MockNetwork, usize, usize> {
+            assert!(self.total > 0);
+
+            let connected = (0..self.total)
+                .filter(|i| i != &self.replica_number)
+                .collect::<Vec<usize>>();
+
+            let network = MockNetwork::new(connected);
+
+            Replica::new(self.replica_number, self.total, MockService, network)
+        }
+    }
+
+    impl Default for MockReplicaBuilder {
+        fn default() -> Self {
+            MockReplicaBuilder {
+                replica_number: 0,
+                total: 3,
+            }
+        }
     }
 
     #[test]
@@ -1074,7 +1145,7 @@ mod tests {
             client_id: 1,
             operation: 0,
         });
-        let mut replica = create_primary(3);
+        let mut replica = MockReplicaBuilder::new().build();
 
         // when
         let result = replica.handle_message(request.clone());
@@ -1133,7 +1204,7 @@ mod tests {
             client_id: 1,
             operation: 0,
         });
-        let mut replica = create_primary(3);
+        let mut replica = MockReplicaBuilder::new().build();
         replica.client_table = HashMap::from_iter([(
             1,
             ClientTableEntry {
@@ -1169,7 +1240,7 @@ mod tests {
             client_id: 1,
             operation: 0,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
 
         // when
         let result = replica.handle_message(request);
@@ -1189,7 +1260,7 @@ mod tests {
             client_id: 1,
             operation: 0,
         });
-        let mut replica = create_primary(3);
+        let mut replica = MockReplicaBuilder::new().build();
 
         // when
         let result = replica.handle_message(request.clone());
@@ -1212,7 +1283,7 @@ mod tests {
                 operation: 0,
             },
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
 
         // when
         let result = replica.handle_message(prepare);
@@ -1268,7 +1339,7 @@ mod tests {
                 operation: 1,
             },
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.log.append(0, 1, 1);
 
         // when
@@ -1299,7 +1370,7 @@ mod tests {
             replica_number: 1,
             client_id: 1,
         });
-        let mut replica = create_primary(3);
+        let mut replica = MockReplicaBuilder::new().build();
         let operation = 0;
         replica.log.append(operation, 1, 1);
         replica.client_table.insert(
@@ -1335,7 +1406,7 @@ mod tests {
             1,
             ClientTableEntry {
                 request_number: 1,
-                response: Some(MockService.execute(&operation)),
+                response: Some(MockService.execute(&operation).unwrap()),
             },
         );
         assert_eq!(replica.client_table, client_table);
@@ -1344,7 +1415,7 @@ mod tests {
         let reply_message = ReplyMessage {
             view: 0,
             request_number: 1,
-            result: MockService.execute(&operation),
+            result: MockService.execute(&operation).unwrap(),
         };
         assert_eq!(*replica.network.incoming.borrow(), HashMap::new());
         assert_eq!(
@@ -1362,7 +1433,7 @@ mod tests {
             replica_number: 1,
             client_id: 1,
         });
-        let mut replica = create_primary(5);
+        let mut replica = MockReplicaBuilder::new().total(5).build();
         let operation = 0;
         replica.log.append(operation, 1, 1);
         replica.client_table.insert(
@@ -1402,7 +1473,7 @@ mod tests {
             view: 0,
             operation_number: 2,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.operation_number = 2;
         replica.commit_number = 0;
         replica.log.append(0, 1, 1);
@@ -1429,7 +1500,7 @@ mod tests {
             view: 0,
             operation_number: 2,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.operation_number = 0;
         replica.commit_number = 0;
 
@@ -1463,7 +1534,7 @@ mod tests {
             operation_number: 1,
             replica_number: 2,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.operation_number = 3;
         replica.commit_number = 2;
         replica.log.append(0, 1, 1);
@@ -1525,7 +1596,7 @@ mod tests {
             operation_number: 3,
             commit_number: 2,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.log.append(0, 1, 1);
         replica.operation_number = 1;
 
@@ -1554,7 +1625,7 @@ mod tests {
     #[test]
     fn triggers_view_change() {
         // given
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.committed_at = Instant::now() - (IDLE_TIMEOUT_MS * 2);
 
         // when
@@ -1584,7 +1655,7 @@ mod tests {
     #[test]
     fn triggers_view_change_respects_replica_status() {
         // given
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.view = 0;
         replica.committed_at = Instant::now() - (IDLE_TIMEOUT_MS * 2);
         replica.status = ReplicaStatus::ViewChange;
@@ -1610,7 +1681,7 @@ mod tests {
             new_view: 1,
             replica_number: 1,
         });
-        let mut replica = create_primary(3);
+        let mut replica = MockReplicaBuilder::new().build();
         replica.operation_number = 1;
         replica.log.append(0, 1, 1);
 
@@ -1653,7 +1724,7 @@ mod tests {
             new_view: 1,
             replica_number: 1,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.view = 0;
         replica.operation_number = 1;
         replica.log.append(0, 1, 1);
@@ -1706,7 +1777,7 @@ mod tests {
             replica_number: 0,
         });
 
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.view_acks = BinaryHeap::from([ViewAck {
             old_view: 0,
             operation_number: 1,
@@ -1784,7 +1855,7 @@ mod tests {
             replica_number: 0,
         });
 
-        let mut replica = create_backup(5);
+        let mut replica = MockReplicaBuilder::new().backup().total(5).build();
 
         // when
         let result = replica.handle_message(do_view_change);
@@ -1821,7 +1892,7 @@ mod tests {
             commit_number: 1,
         });
 
-        let mut replica = create_primary(3);
+        let mut replica = MockReplicaBuilder::new().build();
         replica.view = 0;
         replica.operation_number = 1;
         replica.log.append(0, 1, 1);
@@ -1868,7 +1939,7 @@ mod tests {
     #[test]
     fn triggers_recovery() {
         // given
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
 
         // when
         let result = replica.trigger_recovery();
@@ -1906,7 +1977,7 @@ mod tests {
             replica_number: 1,
             nonce: 1234,
         });
-        let mut replica = create_primary(3);
+        let mut replica = MockReplicaBuilder::new().build();
         replica.view = 0;
         replica.commit_number = 1;
         replica.operation_number = 2;
@@ -1945,7 +2016,7 @@ mod tests {
             replica_number: 1,
             nonce: 1234,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.view = 0;
         replica.commit_number = 1;
         replica.operation_number = 2;
@@ -1989,7 +2060,7 @@ mod tests {
                 commit_number: 1,
             }),
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.status = ReplicaStatus::Recovering { nonce: 1234 };
         replica.recovery_acks.push(RecoveryAck {
             primary: Some(RecoveryPrimaryAck {
@@ -2055,7 +2126,7 @@ mod tests {
                 commit_number: 1,
             }),
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.status = ReplicaStatus::Recovering { nonce: 1234 };
 
         // when
@@ -2096,7 +2167,7 @@ mod tests {
             nonce: 1234,
             primary: None,
         });
-        let mut replica = create_backup(3);
+        let mut replica = MockReplicaBuilder::new().backup().build();
         replica.status = ReplicaStatus::Recovering { nonce: 1234 };
         replica.recovery_acks.push(RecoveryAck {
             primary: None,
