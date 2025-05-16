@@ -41,6 +41,7 @@ enum Operation {
 
 fn main() {
     let config = Config {
+        current: 0,
         addresses: vec!["ip-1".to_string(), "ip-2".to_string(), "ip-3".to_string()],
     };
 

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::AddrParseError};
 
 use client::Client;
 use crossbeam::channel::unbounded;
 use network::{AttachedChannel, ClientConnection, Message, ReplicaNetwork};
-use replica::{Replica, quorum};
+use replica::{Replica, ReplicaConfig, quorum};
 use thiserror::Error;
 
 /* VSR (Viewstamped Replication Revisited)
@@ -65,17 +65,33 @@ Recovery protocol
  3. The recovering replica waits to receiver at least `quorum + 1` messages from different replicas with the `nonce` value sent, including one from the primary of the latest view it learns of these messages. Then, it updates its state using the information from the primary, changes its status to normal and is available to receive more requests.
 */
 
+pub mod bus;
 mod client;
+pub mod clock;
+pub mod io;
 mod network;
 pub mod replica;
 
 pub struct Config {
+    pub current: usize,
     pub addresses: Vec<String>,
 }
 
 pub struct Cluster;
 
 impl Cluster {
+    pub fn parse_config(config: &Config) -> Result<ReplicaConfig, InputError> {
+        let mut socket_addresses = Vec::with_capacity(config.addresses.len());
+        for address in &config.addresses {
+            socket_addresses.push(address.parse()?)
+        }
+
+        Ok(ReplicaConfig {
+            replica: config.current,
+            total: socket_addresses.len(),
+            addresses: socket_addresses,
+        })
+    }
     pub fn create<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send>(
         config: &Config,
         service: S,
@@ -137,6 +153,13 @@ impl Cluster {
 
         panic!("Primary could not be found")
     }
+}
+
+#[derive(Error, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum InputError {
+    #[error(transparent)]
+    ParseAddressError(#[from] AddrParseError),
 }
 
 #[derive(Error, Debug, PartialEq, Clone)]

@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
+    net::SocketAddr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +21,18 @@ use crate::{
 const PERIODIC_INTERVAL: Duration = Duration::from_millis(20);
 const COMMIT_TIMEOUT_MS: Duration = Duration::from_millis(200);
 const IDLE_TIMEOUT_MS: Duration = Duration::from_millis(2000);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicaConfig {
+    /// The current replica number given the configuration.
+    pub(crate) replica: usize,
+
+    /// The total amount of replicas.
+    pub(crate) total: usize,
+
+    /// The socket addresses of all the replicas (including itself).
+    pub(crate) addresses: Vec<SocketAddr>,
+}
 
 /// A single replica
 pub struct Replica<S, N, I, O> {
