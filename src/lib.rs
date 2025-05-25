@@ -3,6 +3,7 @@ use std::{collections::HashMap, net::AddrParseError};
 use bincode::{Decode, Encode};
 use client::Client;
 use crossbeam::channel::unbounded;
+use io::IOError;
 use network::{AttachedChannel, ClientConnection, Message, Operation, ReplicaNetwork};
 use replica::{Replica, ReplicaConfig, quorum};
 use thiserror::Error;
@@ -158,13 +159,15 @@ pub enum InputError {
     ParseAddressError(#[from] AddrParseError),
 }
 
-#[derive(Error, Debug, PartialEq, Clone)]
+#[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ServiceError {
     #[error("Unrecoverable error: {0}")]
     Unrecoverable(String),
     #[error("Recoverable error: {0}")]
     Recoverable(String),
+    #[error(transparent)]
+    IO(#[from] IOError),
 }
 
 pub trait Service {
@@ -174,21 +177,20 @@ pub trait Service {
     fn execute(&self, input: Self::Input) -> Result<Self::Output, ServiceError>;
 
     fn execute_bytes(&self, input: &[u8]) -> Result<Operation, ServiceError> {
-        let input = decode(input);
+        let input = decode(input)?;
         let output = self.execute(input)?;
 
-        Ok(encode(output))
+        Ok(encode(output)?)
     }
 }
 
-fn encode<T: Encode>(value: T) -> Operation {
+fn encode<T: Encode>(value: T) -> Result<Operation, IOError> {
     let mut buf = [0; OPERATION_SIZE_MAX];
-    bincode::encode_into_slice(value, &mut buf, bincode::config::standard()).unwrap(); // TODO: handle this
-
-    buf
+    bincode::encode_into_slice(value, &mut buf, bincode::config::standard())?;
+    Ok(buf)
 }
 
-fn decode<T: Decode<()>>(value: &[u8]) -> T {
-    let (result, _) = bincode::decode_from_slice(value, bincode::config::standard()).unwrap(); // TODO: handle this
-    result
+fn decode<T: Decode<()>>(value: &[u8]) -> Result<T, IOError> {
+    let (result, _) = bincode::decode_from_slice(value, bincode::config::standard())?;
+    Ok(result)
 }

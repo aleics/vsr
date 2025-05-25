@@ -3,6 +3,7 @@ use rand_chacha::ChaCha8Rng;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::{cmp, collections::HashMap, time::Duration};
 
+use crate::io::IOError;
 use crate::network::Message;
 use crate::{
     ReplicaConfig,
@@ -143,12 +144,12 @@ impl<I: IO> MessageBus<I> {
         })
     }
 
-    pub fn init(&mut self) -> std::io::Result<()> {
+    pub fn init(&mut self) -> Result<(), IOError> {
         self.socket = Some(self.io.open_tcp(self.address)?);
         Ok(())
     }
 
-    fn run_for_ns(&mut self, nanos: u64) -> std::io::Result<Vec<Message>> {
+    fn run_for_ns(&mut self, nanos: u64) -> Result<Vec<Message>, IOError> {
         let duration = Duration::from_nanos(nanos);
 
         let mut messages = Vec::new();
@@ -166,7 +167,7 @@ impl<I: IO> MessageBus<I> {
         Ok(messages)
     }
 
-    fn connect_to_other_replicas(&mut self) -> std::io::Result<()> {
+    fn connect_to_other_replicas(&mut self) -> Result<(), IOError> {
         let replicas = self.replicas.clone();
         for (replica, connection_id) in replicas.into_iter() {
             self.connect_to_replica(replica, connection_id);
@@ -221,7 +222,7 @@ impl<I: IO> MessageBus<I> {
         }
     }
 
-    fn accept(&mut self) -> std::io::Result<()> {
+    fn accept(&mut self) -> Result<(), IOError> {
         let socket = self
             .socket
             .as_mut()
@@ -242,7 +243,7 @@ impl<I: IO> MessageBus<I> {
         Ok(())
     }
 
-    fn recv(&mut self, connection_id: usize) -> std::io::Result<Option<Message>> {
+    fn recv(&mut self, connection_id: usize) -> Result<Option<Message>, IOError> {
         let connection = self.connections.get_mut(connection_id).unwrap_or_else(|| {
             panic!(
                 "No connection matches for a received operation (connection_id: {connection_id})"
@@ -264,7 +265,7 @@ impl<I: IO> MessageBus<I> {
         }
     }
 
-    pub fn send(&mut self, replica: usize, message: Message) -> std::io::Result<()> {
+    pub fn send(&mut self, replica: usize, message: Message) -> Result<(), IOError> {
         let connection_id = self
             .replicas
             .get(&replica)
@@ -287,7 +288,7 @@ impl<I: IO> MessageBus<I> {
         Ok(())
     }
 
-    pub fn tick(&mut self) -> std::io::Result<Vec<Message>> {
+    pub fn tick(&mut self) -> Result<Vec<Message>, IOError> {
         self.connect_to_other_replicas()?;
         let messages = self.run_for_ns(200)?;
         self.connect_retry.tick();

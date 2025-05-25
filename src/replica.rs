@@ -127,6 +127,10 @@ where
                     tracing::warn!(err);
                     Ok(None)
                 }
+                ServiceError::IO(err) => {
+                    tracing::error!("IO error occurred while executing operation: {}", err);
+                    Err(ReplicaError::ServiceExecution)
+                }
             },
         }
     }

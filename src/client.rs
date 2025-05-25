@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::{
     OPERATION_SIZE_MAX,
+    io::IOError,
     network::{ReplyMessage, RequestMessage},
 };
 
@@ -42,7 +43,8 @@ impl Client {
         let mut request_number = self.next_request_number.borrow_mut();
 
         let mut buf = [0; OPERATION_SIZE_MAX];
-        bincode::encode_into_slice(operation, &mut buf, bincode::config::standard()).unwrap(); // TODO: handle this
+        bincode::encode_into_slice(operation, &mut buf, bincode::config::standard())
+            .map_err(IOError::Encode)?;
 
         self.channel
             .0
@@ -77,4 +79,6 @@ impl Client {
 pub enum ClientError {
     #[error("A message could not be sent or received")]
     NetworkError,
+    #[error(transparent)]
+    IOError(#[from] IOError),
 }

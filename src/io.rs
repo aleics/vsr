@@ -5,6 +5,7 @@ use std::{io::Write, time::Duration};
 
 use bincode::config::Configuration;
 use polling::{Event, Events, Poller};
+use thiserror::Error;
 
 use crate::MESSAGE_SIZE_MAX;
 use crate::network::Message;
@@ -24,17 +25,17 @@ pub enum RecvBody {
 }
 
 pub trait IO {
-    fn open_tcp(&self, addr: SocketAddr) -> std::io::Result<TcpListener>;
+    fn open_tcp(&self, addr: SocketAddr) -> Result<TcpListener, IOError>;
 
-    fn connect(&mut self, addr: SocketAddr, connection_id: usize) -> std::io::Result<TcpStream>;
+    fn connect(&mut self, addr: SocketAddr, connection_id: usize) -> Result<TcpStream, IOError>;
 
-    fn accept(&mut self, socket: &TcpListener, connection_id: usize) -> std::io::Result<TcpStream>;
+    fn accept(&mut self, socket: &TcpListener, connection_id: usize) -> Result<TcpStream, IOError>;
 
-    fn recv(&self, socket: &mut TcpStream, connection_id: usize) -> std::io::Result<RecvBody>;
+    fn recv(&self, socket: &mut TcpStream, connection_id: usize) -> Result<RecvBody, IOError>;
 
-    fn send(&self, message: Message, socket: &mut TcpStream) -> std::io::Result<()>;
+    fn send(&self, message: Message, socket: &mut TcpStream) -> Result<(), IOError>;
 
-    fn run(&mut self, duration: Duration) -> std::io::Result<Vec<Completion>>;
+    fn run(&mut self, duration: Duration) -> Result<Vec<Completion>, IOError>;
 }
 
 pub struct PollIO {
@@ -44,7 +45,7 @@ pub struct PollIO {
 }
 
 impl PollIO {
-    pub fn new() -> std::io::Result<Self> {
+    pub fn new() -> Result<Self, IOError> {
         Ok(Self {
             poll: Poller::new()?,
             events: Events::with_capacity(EVENTS_CAPACITY),
@@ -54,7 +55,7 @@ impl PollIO {
 }
 
 impl IO for PollIO {
-    fn open_tcp(&self, addr: SocketAddr) -> std::io::Result<TcpListener> {
+    fn open_tcp(&self, addr: SocketAddr) -> Result<TcpListener, IOError> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
 
@@ -65,7 +66,7 @@ impl IO for PollIO {
         Ok(listener)
     }
 
-    fn connect(&mut self, addr: SocketAddr, connection_id: usize) -> std::io::Result<TcpStream> {
+    fn connect(&mut self, addr: SocketAddr, connection_id: usize) -> Result<TcpStream, IOError> {
         match TcpStream::connect(addr) {
             Ok(stream) => {
                 unsafe {
@@ -74,11 +75,11 @@ impl IO for PollIO {
 
                 Ok(stream)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e)?,
         }
     }
 
-    fn accept(&mut self, socket: &TcpListener, connection_id: usize) -> std::io::Result<TcpStream> {
+    fn accept(&mut self, socket: &TcpListener, connection_id: usize) -> Result<TcpStream, IOError> {
         match socket.accept() {
             Ok((stream, _)) => {
                 unsafe {
@@ -87,11 +88,11 @@ impl IO for PollIO {
 
                 Ok(stream)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e)?,
         }
     }
 
-    fn recv(&self, socket: &mut TcpStream, connection_id: usize) -> std::io::Result<RecvBody> {
+    fn recv(&self, socket: &mut TcpStream, connection_id: usize) -> Result<RecvBody, IOError> {
         let mut buf = [0; MESSAGE_SIZE_MAX];
 
         let n = match socket.read(&mut buf) {
@@ -109,20 +110,20 @@ impl IO for PollIO {
             return Ok(RecvBody::Close);
         }
 
-        let (message, _) = bincode::decode_from_slice(&buf, self.config).unwrap(); // TODO: handle this
+        let (message, _) = bincode::decode_from_slice(&buf, self.config)?;
         Ok(RecvBody::Message { message })
     }
 
-    fn send(&self, message: Message, socket: &mut TcpStream) -> std::io::Result<()> {
+    fn send(&self, message: Message, socket: &mut TcpStream) -> Result<(), IOError> {
         let mut buf = [0; MESSAGE_SIZE_MAX];
-        bincode::encode_into_slice(message, &mut buf, self.config).unwrap(); // TODO: handle this
+        bincode::encode_into_slice(message, &mut buf, self.config)?;
 
         socket.write_all(&buf)?;
 
         Ok(())
     }
 
-    fn run(&mut self, duration: Duration) -> std::io::Result<Vec<Completion>> {
+    fn run(&mut self, duration: Duration) -> Result<Vec<Completion>, IOError> {
         self.events.clear();
         self.poll.wait(&mut self.events, Some(duration))?;
 
@@ -144,4 +145,16 @@ impl IO for PollIO {
 
         Ok(completions)
     }
+}
+
+#[derive(Error, Debug)]
+pub enum IOError {
+    #[error(transparent)]
+    IO(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Decode(#[from] bincode::error::DecodeError),
+
+    #[error(transparent)]
+    Encode(#[from] bincode::error::EncodeError),
 }

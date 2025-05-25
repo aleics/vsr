@@ -1,7 +1,7 @@
 use vsr::{
     Cluster, Config,
     bus::MessageBus,
-    io::PollIO,
+    io::{IOError, PollIO},
     network::{Message, Operation, RequestMessage},
 };
 
@@ -22,7 +22,7 @@ fn init_bus(replica: usize, seed: u64) -> MessageBus<PollIO> {
     bus
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), IOError> {
     let seed: u64 = 1234;
 
     std::thread::spawn(move || {
