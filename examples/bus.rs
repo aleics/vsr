@@ -23,12 +23,14 @@ fn main() -> std::io::Result<()> {
     std::thread::spawn(move || {
         let mut count = 0;
         let mut bus = init_bus(0, seed);
+
         loop {
             bus.tick().unwrap();
             count += 1;
 
-            if count % 2000 == 0 {
+            if count % 100000 == 0 {
                 bus.send(1, "hello from replica 0").unwrap();
+                println!("message sent from replica 0");
                 count = 0;
             }
         }
@@ -40,8 +42,9 @@ fn main() -> std::io::Result<()> {
         bus.tick()?;
         count += 1;
 
-        if count % 1000 == 0 {
+        if count % 1000000 == 0 {
             bus.send(0, "hello from replica 1").unwrap();
+            println!("message sent from replica 1");
             count = 0;
         }
     }

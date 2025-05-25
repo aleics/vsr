@@ -72,6 +72,8 @@ pub mod io;
 mod network;
 pub mod replica;
 
+pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
+
 pub struct Config {
     pub current: usize,
     pub addresses: Vec<String>,

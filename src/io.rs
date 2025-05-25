@@ -3,7 +3,10 @@ use std::num::NonZeroUsize;
 use std::{io::Read, net::SocketAddr};
 use std::{io::Write, time::Duration};
 
+use bincode::config::Configuration;
 use polling::{Event, Events, Poller};
+
+use crate::MESSAGE_SIZE_MAX;
 
 const SERVER: usize = 0;
 const EVENTS_CAPACITY: NonZeroUsize = NonZeroUsize::new(128).unwrap();
@@ -36,6 +39,7 @@ pub trait IO {
 pub struct PollIO {
     poll: Poller,
     events: Events,
+    config: Configuration,
 }
 
 impl PollIO {
@@ -43,6 +47,7 @@ impl PollIO {
         Ok(Self {
             poll: Poller::new()?,
             events: Events::with_capacity(EVENTS_CAPACITY),
+            config: bincode::config::standard(),
         })
     }
 }
@@ -87,7 +92,7 @@ impl IO for PollIO {
     }
 
     fn recv(&self, socket: &mut TcpStream, connection_id: usize) -> std::io::Result<RecvBody> {
-        let mut buf = [0; 1024];
+        let mut buf = [0; MESSAGE_SIZE_MAX];
 
         let n = match socket.read(&mut buf) {
             Ok(n) => Ok(n),
@@ -104,12 +109,15 @@ impl IO for PollIO {
             return Ok(RecvBody::Close);
         }
 
-        let message = String::from_utf8(buf[..n].to_vec()).unwrap();
+        let (message, _) = bincode::decode_from_slice(&buf, self.config).unwrap(); // TODO: handle this
         Ok(RecvBody::Message { message })
     }
 
     fn send(&self, message: &str, socket: &mut TcpStream) -> std::io::Result<()> {
-        socket.write_all(message.as_bytes())?;
+        let mut buf = [0; MESSAGE_SIZE_MAX];
+        bincode::encode_into_slice(message, &mut buf, self.config).unwrap(); // TODO: handle this
+
+        socket.write_all(&buf)?;
 
         Ok(())
     }
