@@ -1,12 +1,16 @@
 use std::cell::RefCell;
 
+use bincode::{Decode, Encode};
 use crossbeam::channel::{Receiver, Sender};
 use thiserror::Error;
 
-use crate::network::{ReplyMessage, RequestMessage};
+use crate::{
+    OPERATION_SIZE_MAX,
+    network::{ReplyMessage, RequestMessage},
+};
 
 #[derive(Debug)]
-pub struct Client<I, O> {
+pub struct Client {
     /// Client identification
     client_id: usize,
 
@@ -17,18 +21,14 @@ pub struct Client<I, O> {
     next_request_number: RefCell<usize>,
 
     /// Communication channel between a client and the replicas
-    channel: (Sender<RequestMessage<I>>, Receiver<ReplyMessage<O>>),
+    channel: (Sender<RequestMessage>, Receiver<ReplyMessage>),
 }
 
-impl<I, O> Client<I, O>
-where
-    I: Clone + Send,
-    O: Clone + Send,
-{
+impl Client {
     pub(crate) fn new(
         client_id: usize,
         view: usize,
-        channel: (Sender<RequestMessage<I>>, Receiver<ReplyMessage<O>>),
+        channel: (Sender<RequestMessage>, Receiver<ReplyMessage>),
     ) -> Self {
         Client {
             client_id,
@@ -38,8 +38,11 @@ where
         }
     }
 
-    pub fn send(&self, operation: I) -> Result<(), ClientError> {
+    pub fn send<I: Encode>(&self, operation: I) -> Result<(), ClientError> {
         let mut request_number = self.next_request_number.borrow_mut();
+
+        let mut buf = [0; OPERATION_SIZE_MAX];
+        bincode::encode_into_slice(operation, &mut buf, bincode::config::standard()).unwrap(); // TODO: handle this
 
         self.channel
             .0
@@ -47,7 +50,7 @@ where
                 client_id: self.client_id,
                 view: self.view,
                 request_number: *request_number,
-                operation,
+                operation: buf,
             })
             .map_err(|_| ClientError::NetworkError)?;
 
@@ -56,14 +59,17 @@ where
         Ok(())
     }
 
-    pub fn recv(&self) -> Result<O, ClientError> {
+    pub fn recv<O: Decode<()>>(&self) -> Result<O, ClientError> {
         let reply = self
             .channel
             .1
             .recv()
             .map_err(|_| ClientError::NetworkError)?;
 
-        Ok(reply.result)
+        let (result, _) =
+            bincode::decode_from_slice(&reply.result, bincode::config::standard()).unwrap();
+
+        Ok(result)
     }
 }
 

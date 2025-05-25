@@ -7,17 +7,18 @@ use bincode::config::Configuration;
 use polling::{Event, Events, Poller};
 
 use crate::MESSAGE_SIZE_MAX;
+use crate::network::Message;
 
 const SERVER: usize = 0;
 const EVENTS_CAPACITY: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
-pub enum Operation {
+pub enum Completion {
     Accept,
     Recv { connection: usize },
 }
 
 pub enum RecvBody {
-    Message { message: String }, // TODO: use replica message
+    Message { message: Box<Message> },
     SocketOccupied,
     Close,
 }
@@ -31,9 +32,9 @@ pub trait IO {
 
     fn recv(&self, socket: &mut TcpStream, connection_id: usize) -> std::io::Result<RecvBody>;
 
-    fn send(&self, message: &str, socket: &mut TcpStream) -> std::io::Result<()>;
+    fn send(&self, message: Message, socket: &mut TcpStream) -> std::io::Result<()>;
 
-    fn run(&mut self, duration: Duration) -> std::io::Result<Vec<Operation>>;
+    fn run(&mut self, duration: Duration) -> std::io::Result<Vec<Completion>>;
 }
 
 pub struct PollIO {
@@ -78,7 +79,6 @@ impl IO for PollIO {
     }
 
     fn accept(&mut self, socket: &TcpListener, connection_id: usize) -> std::io::Result<TcpStream> {
-        println!("accept");
         match socket.accept() {
             Ok((stream, _)) => {
                 unsafe {
@@ -113,7 +113,7 @@ impl IO for PollIO {
         Ok(RecvBody::Message { message })
     }
 
-    fn send(&self, message: &str, socket: &mut TcpStream) -> std::io::Result<()> {
+    fn send(&self, message: Message, socket: &mut TcpStream) -> std::io::Result<()> {
         let mut buf = [0; MESSAGE_SIZE_MAX];
         bincode::encode_into_slice(message, &mut buf, self.config).unwrap(); // TODO: handle this
 
@@ -122,11 +122,11 @@ impl IO for PollIO {
         Ok(())
     }
 
-    fn run(&mut self, duration: Duration) -> std::io::Result<Vec<Operation>> {
+    fn run(&mut self, duration: Duration) -> std::io::Result<Vec<Completion>> {
         self.events.clear();
         self.poll.wait(&mut self.events, Some(duration))?;
 
-        let mut operations = Vec::with_capacity(EVENTS_CAPACITY.get());
+        let mut completions = Vec::with_capacity(EVENTS_CAPACITY.get());
 
         for event in self.events.iter() {
             if event.is_err().unwrap_or_default() {
@@ -134,14 +134,14 @@ impl IO for PollIO {
                 continue;
             }
 
-            let operation = match event.key {
-                SERVER => Operation::Accept,
-                token => Operation::Recv { connection: token },
+            let completion = match event.key {
+                SERVER => Completion::Accept,
+                token => Completion::Recv { connection: token },
             };
 
-            operations.push(operation);
+            completions.push(completion);
         }
 
-        Ok(operations)
+        Ok(completions)
     }
 }

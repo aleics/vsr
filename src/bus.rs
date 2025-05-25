@@ -3,10 +3,11 @@ use rand_chacha::ChaCha8Rng;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::{cmp, collections::HashMap, time::Duration};
 
+use crate::network::Message;
 use crate::{
     ReplicaConfig,
     clock::Timeout,
-    io::{IO, Operation, RecvBody},
+    io::{Completion, IO, RecvBody},
 };
 
 const CONNECT_RETRY_TIMEOUT_ID: &str = "connect_retry_timeout";
@@ -74,6 +75,7 @@ fn compute_jittered_backoff(attempt: u32, min: u64, max: u64, rng: &mut ChaCha8R
     result
 }
 
+#[derive(Debug)]
 struct Connection {
     address: SocketAddr,
     status: ConnectionStatus,
@@ -146,17 +148,22 @@ impl<I: IO> MessageBus<I> {
         Ok(())
     }
 
-    fn run_for_ns(&mut self, nanos: u64) -> std::io::Result<()> {
+    fn run_for_ns(&mut self, nanos: u64) -> std::io::Result<Vec<Message>> {
         let duration = Duration::from_nanos(nanos);
 
-        for operation in self.io.run(duration)? {
-            match operation {
-                Operation::Accept => self.accept()?,
-                Operation::Recv { connection } => self.recv(connection)?,
+        let mut messages = Vec::new();
+        for completion in self.io.run(duration)? {
+            match completion {
+                Completion::Accept => self.accept()?,
+                Completion::Recv { connection } => {
+                    if let Some(message) = self.recv(connection)? {
+                        messages.push(message);
+                    }
+                }
             }
         }
 
-        Ok(())
+        Ok(messages)
     }
 
     fn connect_to_other_replicas(&mut self) -> std::io::Result<()> {
@@ -169,9 +176,8 @@ impl<I: IO> MessageBus<I> {
     }
 
     fn connect_to_replica(&mut self, replica: usize, connection_id: usize) -> Option<usize> {
-        let connection = self.connections.get_mut(connection_id).unwrap_or_else(|| panic!(
-            "Connection must be initialized (replica: {replica}, connection_id: {connection_id})"
-        ));
+        let connection = self.connections.get_mut(connection_id)
+            .unwrap_or_else(|| panic!("Connection must be initialized (replica: {replica}, connection_id: {connection_id})"));
 
         if let ConnectionStatus::Connected = connection.status {
             return Some(connection_id);
@@ -185,9 +191,7 @@ impl<I: IO> MessageBus<I> {
             let socket = connection
                 .socket
                 .as_ref()
-                .unwrap_or_else(|| panic!(
-                    "Connection that is connecting must have already a socket assigned (replica: {replica}, connection_id: {connection_id})"
-                ));
+                .unwrap_or_else(|| panic!("Connection that is connecting must have already a socket assigned (replica: {replica}, connection_id: {connection_id})"));
 
             match socket.peer_addr() {
                 Ok(..) => {
@@ -220,10 +224,11 @@ impl<I: IO> MessageBus<I> {
     fn accept(&mut self) -> std::io::Result<()> {
         let socket = self
             .socket
-            .as_ref()
+            .as_mut()
             .expect("Replica socket not available while accepting new connections");
 
         let connection_id = self.connections.len();
+
         let socket = self.io.accept(socket, connection_id)?;
 
         let connection = Connection {
@@ -237,7 +242,7 @@ impl<I: IO> MessageBus<I> {
         Ok(())
     }
 
-    fn recv(&mut self, connection_id: usize) -> std::io::Result<()> {
+    fn recv(&mut self, connection_id: usize) -> std::io::Result<Option<Message>> {
         let connection = self.connections.get_mut(connection_id).unwrap_or_else(|| {
             panic!(
                 "No connection matches for a received operation (connection_id: {connection_id})"
@@ -246,33 +251,27 @@ impl<I: IO> MessageBus<I> {
 
         assert!(connection.status == ConnectionStatus::Connected);
 
-        let socket = connection.socket.as_mut().unwrap_or_else(|| panic!(
-            "Connection that is connected must have already a socket assigned (connection_id: {connection_id})",
-        ));
+        let socket = connection.socket.as_mut()
+            .unwrap_or_else(|| panic!("Connection that is connected must have already a socket assigned (connection_id: {connection_id})"));
 
         match self.io.recv(socket, connection_id)? {
-            RecvBody::Message { message } => {
-                println!("Message received {message}");
-            }
+            RecvBody::Message { message } => Ok(Some(*message)),
             RecvBody::Close => {
                 self.connections.remove(connection_id);
-                println!("Connection closed")
+                Ok(None)
             }
-            RecvBody::SocketOccupied => return Ok(()),
+            RecvBody::SocketOccupied => Ok(None),
         }
-
-        Ok(())
     }
 
-    pub fn send(&mut self, replica: usize, message: &str) -> std::io::Result<()> {
+    pub fn send(&mut self, replica: usize, message: Message) -> std::io::Result<()> {
         let connection_id = self
             .replicas
             .get(&replica)
             .unwrap_or_else(|| panic!("Replica not found (replica: {replica})"));
 
-        let connection = self.connections.get_mut(*connection_id).unwrap_or_else(|| panic!(
-            "Connection for replica not found (replica: {replica}, connection_id: {connection_id})"
-        ));
+        let connection = self.connections.get_mut(*connection_id)
+            .unwrap_or_else(|| panic!("Connection for replica not found (replica: {replica}, connection_id: {connection_id})"));
 
         if connection.status != ConnectionStatus::Connected {
             return Ok(());
@@ -288,11 +287,11 @@ impl<I: IO> MessageBus<I> {
         Ok(())
     }
 
-    pub fn tick(&mut self) -> std::io::Result<()> {
+    pub fn tick(&mut self) -> std::io::Result<Vec<Message>> {
         self.connect_to_other_replicas()?;
-        self.run_for_ns(200)?;
+        let messages = self.run_for_ns(200)?;
         self.connect_retry.tick();
 
-        Ok(())
+        Ok(messages)
     }
 }

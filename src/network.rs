@@ -1,41 +1,45 @@
 use std::collections::HashMap;
 
+use bincode::{Decode, Encode};
 use crossbeam::channel::{Receiver, Sender, unbounded};
 
-use crate::replica::{Log, ReplicaError};
+use crate::{
+    OPERATION_SIZE_MAX,
+    replica::{Log, ReplicaError},
+};
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Message<I> {
-    Request(RequestMessage<I>),
-    Prepare(PrepareMessage<I>),
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub enum Message {
+    Request(RequestMessage),
+    Prepare(PrepareMessage),
     PrepareOk(PrepareOkMessage),
     Commit(CommitMessage),
     GetState(GetStateMessage),
-    NewState(NewStateMessage<I>),
+    NewState(NewStateMessage),
     StartViewChange(StartViewChangeMessage),
-    DoViewChange(DoViewChangeMessage<I>),
-    StartView(StartViewMessage<I>),
+    DoViewChange(DoViewChangeMessage),
+    StartView(StartViewMessage),
     Recovery(RecoveryMessage),
-    RecoveryResponse(RecoveryResponseMessage<I>),
+    RecoveryResponse(RecoveryResponseMessage),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RequestMessage<I> {
-    pub(crate) view: usize,
-    pub(crate) request_number: usize,
-    pub(crate) client_id: usize,
-    pub(crate) operation: I,
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct RequestMessage {
+    pub view: usize,
+    pub request_number: usize,
+    pub client_id: usize,
+    pub operation: Operation,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct PrepareMessage<I> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct PrepareMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
-    pub(crate) request: RequestMessage<I>,
+    pub(crate) request: RequestMessage,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct PrepareOkMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
@@ -43,98 +47,96 @@ pub struct PrepareOkMessage {
     pub(crate) client_id: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct CommitMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct GetStateMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
     pub(crate) replica_number: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct NewStateMessage<I> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct NewStateMessage {
     pub(crate) view: usize,
-    pub(crate) log_after_operation: Log<I>,
+    pub(crate) log_after_operation: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct StartViewChangeMessage {
     pub(crate) new_view: usize,
     pub(crate) replica_number: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DoViewChangeMessage<I> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct DoViewChangeMessage {
     pub(crate) old_view: usize,
     pub(crate) new_view: usize,
-    pub(crate) log: Log<I>,
+    pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
     pub(crate) replica_number: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct StartViewMessage<I> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct StartViewMessage {
     pub(crate) view: usize,
-    pub(crate) log: Log<I>,
+    pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct RecoveryMessage {
     pub(crate) replica_number: usize,
     pub(crate) nonce: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecoveryResponseMessage<I> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct RecoveryResponseMessage {
     pub(crate) view: usize,
     pub(crate) nonce: u64,
-    pub(crate) primary: Option<RecoveryPrimaryResponse<I>>,
+    pub(crate) primary: Option<RecoveryPrimaryResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecoveryPrimaryResponse<I> {
-    pub(crate) log: Log<I>,
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct RecoveryPrimaryResponse {
+    pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReplyMessage<O> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct ReplyMessage {
     pub(crate) view: usize,
     pub(crate) request_number: usize,
-    pub(crate) result: O,
+    pub(crate) result: Operation,
 }
 
-pub(crate) struct AttachedChannel<I, O> {
+pub type Operation = [u8; OPERATION_SIZE_MAX];
+
+pub(crate) struct AttachedChannel {
     pub(crate) client_id: usize,
-    pub(crate) channel: (Sender<RequestMessage<I>>, Receiver<ReplyMessage<O>>),
+    pub(crate) channel: (Sender<RequestMessage>, Receiver<ReplyMessage>),
 }
 
 #[derive(Clone)]
-pub(crate) struct ClientConnection<I, O> {
+pub(crate) struct ClientConnection {
     /// Incoming messages from the client to the replica. The sender is used by the client to connect to the replica.
     /// The receiver is used to receive messages from the client
-    pub(crate) incoming: (Sender<RequestMessage<I>>, Receiver<RequestMessage<I>>),
+    pub(crate) incoming: (Sender<RequestMessage>, Receiver<RequestMessage>),
 
     /// Outgoing messages from the replica to the client.
-    pub(crate) outgoing: Vec<Sender<ReplyMessage<O>>>,
+    pub(crate) outgoing: Vec<Sender<ReplyMessage>>,
 }
 
-impl<I, O> ClientConnection<I, O>
-where
-    I: Clone + Send,
-    O: Send,
-{
+impl ClientConnection {
     pub(crate) fn new() -> Self {
         ClientConnection {
             incoming: unbounded(),
@@ -142,7 +144,7 @@ where
         }
     }
 
-    pub(crate) fn attach(&mut self) -> AttachedChannel<I, O> {
+    pub(crate) fn attach(&mut self) -> AttachedChannel {
         let outgoing = unbounded();
 
         let client_id = self.outgoing.len();
@@ -156,7 +158,7 @@ where
 
     pub(crate) fn send_out(
         &self,
-        message: ReplyMessage<O>,
+        message: ReplyMessage,
         client_id: usize,
     ) -> Result<(), ReplicaError> {
         let Some(sender) = self.outgoing.get(client_id) else {
@@ -168,37 +170,26 @@ where
 }
 
 pub trait Network {
-    type Input;
-    type Output;
+    fn send(&self, message: Message, replica: &usize) -> Result<(), ReplicaError>;
 
-    fn send(&self, message: Message<Self::Input>, replica: &usize) -> Result<(), ReplicaError>;
+    fn broadcast(&self, message: Message) -> Result<(), ReplicaError>;
 
-    fn broadcast(&self, message: Message<Self::Input>) -> Result<(), ReplicaError>;
-
-    fn send_client(
-        &self,
-        message: ReplyMessage<Self::Output>,
-        client_id: usize,
-    ) -> Result<(), ReplicaError>;
+    fn send_client(&self, message: ReplyMessage, client_id: usize) -> Result<(), ReplicaError>;
 }
 
-pub struct ReplicaNetwork<I, O> {
-    pub(crate) client: ClientConnection<I, O>,
-    pub(crate) incoming: Receiver<Message<I>>,
-    pub(crate) other: HashMap<usize, Sender<Message<I>>>,
+pub struct ReplicaNetwork {
+    pub(crate) client: ClientConnection,
+    pub(crate) incoming: Receiver<Message>,
+    pub(crate) other: HashMap<usize, Sender<Message>>,
 }
 
-pub(crate) type MessageChannel<I> = (Sender<Message<I>>, Receiver<Message<I>>);
+pub(crate) type MessageChannel = (Sender<Message>, Receiver<Message>);
 
-impl<I, O> ReplicaNetwork<I, O>
-where
-    I: Clone + Send,
-    O: Send,
-{
+impl ReplicaNetwork {
     pub(crate) fn for_replica(
         replica: usize,
-        client: ClientConnection<I, O>,
-        channels: &[MessageChannel<I>],
+        client: ClientConnection,
+        channels: &[MessageChannel],
     ) -> Self {
         let mut other = HashMap::with_capacity(channels.len() - 1);
         let mut incoming: Option<Receiver<_>> = None;
@@ -219,15 +210,8 @@ where
     }
 }
 
-impl<I, O> Network for ReplicaNetwork<I, O>
-where
-    I: Clone + Send,
-    O: Send,
-{
-    type Input = I;
-    type Output = O;
-
-    fn send(&self, message: Message<I>, replica: &usize) -> Result<(), ReplicaError> {
+impl Network for ReplicaNetwork {
+    fn send(&self, message: Message, replica: &usize) -> Result<(), ReplicaError> {
         let sender = self
             .other
             .get(replica)
@@ -236,7 +220,7 @@ where
         sender.send(message).map_err(|_| ReplicaError::Network)
     }
 
-    fn broadcast(&self, message: Message<I>) -> Result<(), ReplicaError> {
+    fn broadcast(&self, message: Message) -> Result<(), ReplicaError> {
         for sender in self.other.values() {
             sender
                 .send(message.clone())
@@ -245,11 +229,7 @@ where
         Ok(())
     }
 
-    fn send_client(
-        &self,
-        message: ReplyMessage<Self::Output>,
-        client_id: usize,
-    ) -> Result<(), ReplicaError> {
+    fn send_client(&self, message: ReplyMessage, client_id: usize) -> Result<(), ReplicaError> {
         self.client.send_out(message, client_id)
     }
 }

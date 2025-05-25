@@ -2,6 +2,7 @@ use std::sync::Mutex;
 use std::thread::{self, sleep};
 use std::time::Duration;
 
+use bincode::{Decode, Encode};
 use vsr::{Cluster, Config, Service, ServiceError};
 
 #[derive(Debug)]
@@ -13,8 +14,9 @@ impl Service for Counter {
     type Input = Operation;
     type Output = i32;
 
-    fn execute(&self, input: &Self::Input) -> Result<Self::Output, ServiceError> {
+    fn execute(&self, input: Self::Input) -> Result<Self::Output, ServiceError> {
         let mut current_value = self.value.lock().unwrap();
+
         match input {
             Operation::AddOne => *current_value += 1,
             Operation::SubOne => *current_value -= 1,
@@ -33,7 +35,7 @@ impl Clone for Counter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 enum Operation {
     AddOne,
     SubOne,
@@ -63,12 +65,12 @@ fn main() {
 
     client.send(Operation::AddOne).unwrap();
 
-    let result = client.recv().unwrap();
+    let result = client.recv::<i32>().unwrap();
     println!("After plus one: {}", result);
 
     client.send(Operation::SubOne).unwrap();
 
-    let result = client.recv().unwrap();
+    let result = client.recv::<i32>().unwrap();
     println!("After minus one: {}", result);
 
     sleep(Duration::from_secs(10));
@@ -76,7 +78,7 @@ fn main() {
 
     client.send(Operation::AddOne).unwrap();
 
-    let result = client.recv().unwrap();
+    let result = client.recv::<i32>().unwrap();
     println!("After plus one: {}", result);
 
     sleep(Duration::from_secs(1));
@@ -84,7 +86,7 @@ fn main() {
 
     client.send(Operation::SubOne).unwrap();
 
-    let result = client.recv().unwrap();
+    let result = client.recv::<i32>().unwrap();
     println!("After minus one: {}", result);
 
     for handle in handles {

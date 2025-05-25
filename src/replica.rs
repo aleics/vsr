@@ -5,11 +5,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bincode::{Decode, Encode};
 use crossbeam::{channel::tick, select};
 use thiserror::Error;
 
 use crate::{
-    Message, Service, ServiceError,
+    Message, Operation, Service, ServiceError,
     network::{
         CommitMessage, DoViewChangeMessage, GetStateMessage, Network, NewStateMessage,
         PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
@@ -35,7 +36,7 @@ pub struct ReplicaConfig {
 }
 
 /// A single replica
-pub struct Replica<S, N, I, O> {
+pub struct Replica<S, N> {
     /// The current replica number given the configuration.
     replica_number: usize,
 
@@ -59,14 +60,14 @@ pub struct Replica<S, N, I, O> {
 
     /// Heap with the view change acknowledgements sorted by latest view and
     /// operation number.
-    view_acks: BinaryHeap<ViewAck<I>>,
+    view_acks: BinaryHeap<ViewAck>,
 
     /// An unsorted set of recovery acknowledgements coming from other replicas.
-    recovery_acks: Vec<RecoveryAck<I>>,
+    recovery_acks: Vec<RecoveryAck>,
 
     /// Log entries of size "operation_number" containing the requests
     /// that have been received so far in their assigned order.
-    log: Log<I>,
+    log: Log,
 
     /// The operation number of the most recently committed operation.
     commit_number: usize,
@@ -76,7 +77,7 @@ pub struct Replica<S, N, I, O> {
 
     /// For each client, the number of its most recent request, plus,
     /// if the request has been executed, the result sent for that request.
-    client_table: HashMap<usize, ClientTableEntry<O>>,
+    client_table: HashMap<usize, ClientTableEntry>,
 
     /// Service container used by the replica to execute client requests.
     service: S,
@@ -86,12 +87,12 @@ pub struct Replica<S, N, I, O> {
     pub(crate) network: N,
 }
 
-impl<S, I, N, O> Replica<S, N, I, O>
+impl<S, I, N, O> Replica<S, N>
 where
     S: Service<Input = I, Output = O>,
-    N: Network<Input = I, Output = O>,
-    I: Clone + Send,
-    O: Clone + Send,
+    N: Network,
+    I: Decode<()>,
+    O: Encode,
 {
     pub(crate) fn new(replica_number: usize, total: usize, service: S, network: N) -> Self {
         Replica {
@@ -112,25 +113,25 @@ where
         }
     }
 
-    fn execute_operation(&self, input: &I) -> Result<Option<O>, ReplicaError> {
-        let result = self.service.execute(input);
+    fn execute_operation(&self, input: &Operation) -> Result<Option<Operation>, ReplicaError> {
+        let result = self.service.execute_bytes(input);
 
         match result {
             Ok(output) => Ok(Some(output)),
             Err(err) => match err {
                 ServiceError::Unrecoverable(err) => {
-                    tracing::error!("{}", err);
+                    tracing::error!(err);
                     Err(ReplicaError::ServiceExecution)
                 }
                 ServiceError::Recoverable(err) => {
-                    tracing::warn!("{}", err);
+                    tracing::warn!(err);
                     Ok(None)
                 }
             },
         }
     }
 
-    fn handle_message(&mut self, message: Message<I>) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn handle_message(&mut self, message: Message) -> Result<HandleOutput, ReplicaError> {
         match message {
             Message::Request(request) => self.handle_request(request),
             Message::Prepare(prepare) => self.handle_prepare(prepare),
@@ -150,10 +151,7 @@ where
         }
     }
 
-    fn handle_request(
-        &mut self,
-        request: RequestMessage<I>,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn handle_request(&mut self, request: RequestMessage) -> Result<HandleOutput, ReplicaError> {
         // Backup replicas ignore client request message.
         if !self.is_primary() {
             return Ok(HandleOutput::DoNothing);
@@ -178,11 +176,11 @@ where
             }
 
             if most_recent_request.request_number == request.request_number {
-                if let Some(result) = most_recent_request.response.as_ref() {
+                if let Some(result) = most_recent_request.response {
                     let message = ReplyMessage {
                         view: request.view,
                         request_number: most_recent_request.request_number,
-                        result: result.clone(),
+                        result,
                     };
                     return Ok(HandleOutput::send_client(message, request.client_id));
                 }
@@ -194,11 +192,8 @@ where
         assert!(self.operation_number == self.log.size());
 
         self.operation_number += 1;
-        self.log.append(
-            request.operation.clone(),
-            request.request_number,
-            request.client_id,
-        );
+        self.log
+            .append(request.operation, request.request_number, request.client_id);
         self.client_table.insert(
             request.client_id,
             ClientTableEntry {
@@ -216,10 +211,7 @@ where
         })))
     }
 
-    fn handle_prepare(
-        &mut self,
-        prepare: PrepareMessage<I>,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn handle_prepare(&mut self, prepare: PrepareMessage) -> Result<HandleOutput, ReplicaError> {
         // `Prepare` messages must only be received by backup replicas
         assert!(!self.is_primary());
 
@@ -244,7 +236,7 @@ where
 
         self.operation_number = prepare.operation_number;
         self.log.append(
-            prepare.request.operation.clone(),
+            prepare.request.operation,
             prepare.request.request_number,
             prepare.request.client_id,
         );
@@ -284,7 +276,7 @@ where
     fn handle_prepare_ok(
         &mut self,
         prepare_ok: PrepareOkMessage,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+    ) -> Result<HandleOutput, ReplicaError> {
         // `PrepareOk` messages must only be received by the primary
         assert!(self.is_primary());
 
@@ -335,7 +327,7 @@ where
             .expect("Client must be present in the client table since the request message has been already received");
 
         // The primary also updates the client's entry in the client-table to contain the result
-        client_request.response = Some(result.clone());
+        client_request.response = Some(result);
 
         // Send reply message to the client
         Ok(HandleOutput::send_client(
@@ -348,7 +340,7 @@ where
         ))
     }
 
-    fn handle_commit(&mut self, commit: CommitMessage) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn handle_commit(&mut self, commit: CommitMessage) -> Result<HandleOutput, ReplicaError> {
         // Replica is not prepared to handle operations, the commit message is ignored.
         if self.status != ReplicaStatus::Normal {
             return Ok(HandleOutput::DoNothing);
@@ -391,7 +383,7 @@ where
         Ok(HandleOutput::DoNothing)
     }
 
-    fn trigger_state_transfer(&self) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn trigger_state_transfer(&self) -> Result<HandleOutput, ReplicaError> {
         let message = Message::GetState(GetStateMessage {
             view: self.view,
             operation_number: self.operation_number,
@@ -406,7 +398,7 @@ where
     fn handle_get_state(
         &mut self,
         get_state: GetStateMessage,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+    ) -> Result<HandleOutput, ReplicaError> {
         assert!(self.status == ReplicaStatus::Normal);
         assert!(self.view == get_state.view);
 
@@ -424,8 +416,8 @@ where
 
     fn handle_new_state(
         &mut self,
-        new_state: NewStateMessage<I>,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+        new_state: NewStateMessage,
+    ) -> Result<HandleOutput, ReplicaError> {
         assert!(self.view == new_state.view);
 
         self.log.merge(new_state.log_after_operation);
@@ -449,7 +441,7 @@ where
     fn handle_start_view_change(
         &mut self,
         start_view_change: StartViewChangeMessage,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+    ) -> Result<HandleOutput, ReplicaError> {
         let old_view = self.view;
 
         // New backup replica acknowledges a view change and waits for the new primary
@@ -487,8 +479,8 @@ where
 
     fn handle_do_view_change(
         &mut self,
-        do_view_change: DoViewChangeMessage<I>,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+        do_view_change: DoViewChangeMessage,
+    ) -> Result<HandleOutput, ReplicaError> {
         // When the primary received `quorum + 1` `DoViewChange` messages from different replicas
         // (including itself), it sets its view number to that in the messages as selects as the
         // new log the one contained in the message with the largest view.
@@ -538,7 +530,7 @@ where
                     message: ReplyMessage {
                         view: self.view,
                         request_number: log_entry.request_number,
-                        result: result.clone(),
+                        result,
                     },
                     client_id: log_entry.client_id,
                 });
@@ -575,8 +567,8 @@ where
 
     fn handle_start_view(
         &mut self,
-        start_view: StartViewMessage<I>,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+        start_view: StartViewMessage,
+    ) -> Result<HandleOutput, ReplicaError> {
         // Refresh internal state with the new view
         self.status = ReplicaStatus::Normal;
         self.view = start_view.view;
@@ -627,10 +619,7 @@ where
         Ok(HandleOutput::Actions(actions))
     }
 
-    fn handle_recovery(
-        &mut self,
-        recovery: RecoveryMessage,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn handle_recovery(&mut self, recovery: RecoveryMessage) -> Result<HandleOutput, ReplicaError> {
         // A replica won't respond to a recovery if it's not operational
         assert!(self.status == ReplicaStatus::Normal);
 
@@ -660,8 +649,8 @@ where
 
     fn handle_recovery_response(
         &mut self,
-        recovery_response: RecoveryResponseMessage<I>,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+        recovery_response: RecoveryResponseMessage,
+    ) -> Result<HandleOutput, ReplicaError> {
         match self.status {
             ReplicaStatus::Recovering { nonce } => assert!(nonce == recovery_response.nonce),
             _ => panic!("Replica must be in recovering status to handle recovery responses"),
@@ -677,7 +666,7 @@ where
 
         // Read the primary acknowledgements of the latest view. If no acknowledgement from the
         // primary replicas has been received, the recovering replica must wait.
-        let mut ready_ack: Option<&RecoveryPrimaryAck<I>> = None;
+        let mut ready_ack: Option<&RecoveryPrimaryAck> = None;
         for recovery_ack in &self.recovery_acks {
             if let Some(primary_ack) = recovery_ack.primary.as_ref() {
                 if let Some(current) = ready_ack {
@@ -743,7 +732,7 @@ where
         Ok(HandleOutput::DoNothing)
     }
 
-    fn periodic(&mut self) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn periodic(&mut self) -> Result<HandleOutput, ReplicaError> {
         // Primary periodic tasks
         if self.is_primary() {
             // If the primary is idle (no requests sent)
@@ -764,7 +753,7 @@ where
         &self,
         view: usize,
         operation_number: usize,
-    ) -> Result<HandleOutput<I, O>, ReplicaError> {
+    ) -> Result<HandleOutput, ReplicaError> {
         // `Commit` messages must only be received by the primary
         assert!(self.replica_number == view);
 
@@ -776,7 +765,7 @@ where
         Ok(HandleOutput::broadcast(message))
     }
 
-    fn trigger_view_change(&mut self) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn trigger_view_change(&mut self) -> Result<HandleOutput, ReplicaError> {
         // If the replica is not running a view change already, or it's in recovery
         // we won't start a new change.
         if self.status != ReplicaStatus::Normal {
@@ -794,7 +783,7 @@ where
         Ok(HandleOutput::broadcast(message))
     }
 
-    fn trigger_recovery(&mut self) -> Result<HandleOutput<I, O>, ReplicaError> {
+    fn trigger_recovery(&mut self) -> Result<HandleOutput, ReplicaError> {
         let nonce = nonce();
         self.status = ReplicaStatus::Recovering { nonce };
 
@@ -815,11 +804,11 @@ where
     }
 }
 
-impl<S, I, O> Replica<S, ReplicaNetwork<I, O>, I, O>
+impl<S, I, O> Replica<S, ReplicaNetwork>
 where
     S: Service<Input = I, Output = O>,
-    I: Clone + Send,
-    O: Clone + Send,
+    I: Decode<()>,
+    O: Encode,
 {
     pub fn run(mut self) {
         let ticker = tick(PERIODIC_INTERVAL);
@@ -843,7 +832,7 @@ where
         }
     }
 
-    fn handle_output(&self, output: HandleOutput<I, O>) -> Result<(), ReplicaError> {
+    fn handle_output(&self, output: HandleOutput) -> Result<(), ReplicaError> {
         match output {
             HandleOutput::DoNothing => Ok(()),
             HandleOutput::Actions(actions) => {
@@ -885,36 +874,36 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum HandleOutput<I, O> {
-    Actions(Vec<OutputAction<I, O>>),
+enum HandleOutput {
+    Actions(Vec<OutputAction>),
     DoNothing,
 }
 
-impl<I, O> HandleOutput<I, O> {
-    fn broadcast(message: Message<I>) -> Self {
+impl HandleOutput {
+    fn broadcast(message: Message) -> Self {
         HandleOutput::Actions(vec![OutputAction::Broadcast { message }])
     }
 
-    fn send(message: Message<I>, replica: usize) -> Self {
+    fn send(message: Message, replica: usize) -> Self {
         HandleOutput::Actions(vec![OutputAction::Send { message, replica }])
     }
 
-    fn send_client(message: ReplyMessage<O>, client_id: usize) -> Self {
+    fn send_client(message: ReplyMessage, client_id: usize) -> Self {
         HandleOutput::Actions(vec![OutputAction::SendClient { message, client_id }])
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum OutputAction<I, O> {
+enum OutputAction {
     Broadcast {
-        message: Message<I>,
+        message: Message,
     },
     Send {
-        message: Message<I>,
+        message: Message,
         replica: usize,
     },
     SendClient {
-        message: ReplyMessage<O>,
+        message: ReplyMessage,
         client_id: usize,
     },
 }
@@ -932,23 +921,20 @@ fn nonce() -> u64 {
     now.duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Log<I> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct Log {
     /// A queue of log entries for each request sent to the replica.
-    entries: Vec<LogEntry<I>>,
+    entries: Vec<LogEntry>,
 }
 
-impl<I> Log<I>
-where
-    I: Clone,
-{
+impl Log {
     fn new() -> Self {
         Log {
             entries: Vec::new(),
         }
     }
 
-    fn append(&mut self, operation: I, request_number: usize, client_id: usize) {
+    fn append(&mut self, operation: Operation, request_number: usize, client_id: usize) {
         self.entries.push(LogEntry {
             request_number,
             client_id,
@@ -956,18 +942,18 @@ where
         });
     }
 
-    fn get_operation(&self, operation_number: usize) -> Option<&I> {
+    fn get_operation(&self, operation_number: usize) -> Option<&Operation> {
         self.get_entry(operation_number)
             .map(|entry| &entry.operation)
     }
 
-    fn get_entry(&self, operation_number: usize) -> Option<&LogEntry<I>> {
+    fn get_entry(&self, operation_number: usize) -> Option<&LogEntry> {
         // The operation number is a 1-based counter. Thus, we need to subtract 1 to get
         // the associated index
         self.entries.get(operation_number - 1)
     }
 
-    fn since(&self, operation_number: usize) -> Log<I> {
+    fn since(&self, operation_number: usize) -> Log {
         if operation_number >= self.entries.len() {
             return Log::new();
         }
@@ -985,7 +971,7 @@ where
         Log { entries }
     }
 
-    fn merge(&mut self, log: Log<I>) {
+    fn merge(&mut self, log: Log) {
         for entry in log.entries {
             self.entries.push(entry)
         }
@@ -996,20 +982,20 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct LogEntry<T> {
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+struct LogEntry {
     /// The request number of the log.
     request_number: usize,
     /// The client ID that triggered the request.
     client_id: usize,
     /// Operation of the request
-    operation: T,
+    operation: Operation,
 }
 
 #[derive(Debug, PartialEq)]
-struct ClientTableEntry<O> {
+struct ClientTableEntry {
     request_number: usize,
-    response: Option<O>,
+    response: Option<Operation>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1026,28 +1012,28 @@ enum PrepareAck {
 }
 
 #[derive(Debug)]
-struct ViewAck<I> {
+struct ViewAck {
     old_view: usize,
     operation_number: usize,
     commit_number: usize,
-    log: Log<I>,
+    log: Log,
 }
 
-impl<I> PartialEq for ViewAck<I> {
+impl PartialEq for ViewAck {
     fn eq(&self, other: &Self) -> bool {
         self.old_view == other.old_view && self.operation_number == other.operation_number
     }
 }
 
-impl<I> Eq for ViewAck<I> {}
+impl Eq for ViewAck {}
 
-impl<I> PartialOrd for ViewAck<I> {
+impl PartialOrd for ViewAck {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<I> Ord for ViewAck<I> {
+impl Ord for ViewAck {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.old_view.cmp(&other.old_view).then_with(|| {
             self.operation_number
@@ -1058,13 +1044,13 @@ impl<I> Ord for ViewAck<I> {
 }
 
 #[derive(Debug, PartialEq)]
-struct RecoveryAck<I> {
-    primary: Option<RecoveryPrimaryAck<I>>,
+struct RecoveryAck {
+    primary: Option<RecoveryPrimaryAck>,
     view: usize,
 }
 
-impl<I> RecoveryAck<I> {
-    fn from_message(message: RecoveryResponseMessage<I>) -> Self {
+impl RecoveryAck {
+    fn from_message(message: RecoveryResponseMessage) -> Self {
         let primary = message.primary.map(|response| RecoveryPrimaryAck {
             log: response.log,
             operation_number: response.operation_number,
@@ -1080,8 +1066,8 @@ impl<I> RecoveryAck<I> {
 }
 
 #[derive(Debug, PartialEq)]
-struct RecoveryPrimaryAck<I> {
-    log: Log<I>,
+struct RecoveryPrimaryAck {
+    log: Log,
     operation_number: usize,
     commit_number: usize,
     view: usize,
@@ -1118,6 +1104,7 @@ mod tests {
     };
 
     use crate::{
+        Operation,
         network::{
             CommitMessage, DoViewChangeMessage, GetStateMessage, Message, Network, NewStateMessage,
             PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
@@ -1133,8 +1120,8 @@ mod tests {
     use super::{Replica, Service, ServiceError};
 
     struct MockNetwork {
-        incoming: RefCell<HashMap<usize, Message<usize>>>,
-        outgoing: RefCell<HashMap<usize, ReplyMessage<usize>>>,
+        incoming: RefCell<HashMap<usize, Message>>,
+        outgoing: RefCell<HashMap<usize, ReplyMessage>>,
         connected_replicas: Vec<usize>,
     }
 
@@ -1149,20 +1136,13 @@ mod tests {
     }
 
     impl Network for MockNetwork {
-        type Input = usize;
-        type Output = usize;
-
-        fn send(
-            &self,
-            message: Message<Self::Input>,
-            replica: &usize,
-        ) -> Result<(), super::ReplicaError> {
+        fn send(&self, message: Message, replica: &usize) -> Result<(), super::ReplicaError> {
             let mut incoming = self.incoming.borrow_mut();
             incoming.insert(*replica, message);
             Ok(())
         }
 
-        fn broadcast(&self, message: Message<Self::Input>) -> Result<(), super::ReplicaError> {
+        fn broadcast(&self, message: Message) -> Result<(), super::ReplicaError> {
             let mut incoming = self.incoming.borrow_mut();
             for replica in &self.connected_replicas {
                 incoming.insert(*replica, message.clone());
@@ -1172,7 +1152,7 @@ mod tests {
 
         fn send_client(
             &self,
-            message: ReplyMessage<Self::Output>,
+            message: ReplyMessage,
             client_id: usize,
         ) -> Result<(), super::ReplicaError> {
             let mut outgoing = self.outgoing.borrow_mut();
@@ -1188,7 +1168,7 @@ mod tests {
         type Input = usize;
         type Output = usize;
 
-        fn execute(&self, input: &Self::Input) -> Result<Self::Output, ServiceError> {
+        fn execute(&self, input: Self::Input) -> Result<Self::Output, ServiceError> {
             Ok(input + 1)
         }
     }
@@ -1213,7 +1193,7 @@ mod tests {
             self
         }
 
-        fn build(self) -> Replica<MockService, MockNetwork, usize, usize> {
+        fn build(self) -> Replica<MockService, MockNetwork> {
             assert!(self.total > 0);
 
             let connected = (0..self.total)
@@ -1235,14 +1215,21 @@ mod tests {
         }
     }
 
+    fn usize_as_bytes(value: usize) -> Operation {
+        let mut buffer = [0; 1024];
+        bincode::encode_into_slice(value, &mut buffer, bincode::config::standard()).unwrap();
+        buffer
+    }
+
     #[test]
     fn handles_request() {
         // given
+        let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
             view: 0,
             request_number: 1,
             client_id: 1,
-            operation: 0,
+            operation,
         });
         let mut replica = MockReplicaBuilder::new().build();
 
@@ -1260,7 +1247,7 @@ mod tests {
                     view: 0,
                     request_number: 1,
                     client_id: 1,
-                    operation: 0,
+                    operation,
                 },
             })))
         );
@@ -1274,7 +1261,7 @@ mod tests {
 
         // log is correct
         let mut log = Log::new();
-        log.append(0, 1, 1);
+        log.append(operation, 1, 1);
         assert_eq!(replica.log, log);
 
         // client table is correct
@@ -1292,18 +1279,19 @@ mod tests {
     #[test]
     fn handles_request_returns_most_recent_response() {
         // given
+        let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
             view: 0,
             request_number: 1,
             client_id: 1,
-            operation: 0,
+            operation,
         });
         let mut replica = MockReplicaBuilder::new().build();
         replica.client_table = HashMap::from_iter([(
             1,
             ClientTableEntry {
                 request_number: 1,
-                response: Some(1),
+                response: Some(usize_as_bytes(1)),
             },
         )]);
 
@@ -1317,7 +1305,7 @@ mod tests {
                 ReplyMessage {
                     view: 0,
                     request_number: 1,
-                    result: 1
+                    result: usize_as_bytes(1),
                 },
                 1
             ))
@@ -1327,11 +1315,12 @@ mod tests {
     #[test]
     fn handles_request_backup_replica_ignores() {
         // given
+        let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
             view: 1,
             request_number: 1,
             client_id: 1,
-            operation: 0,
+            operation,
         });
         let mut replica = MockReplicaBuilder::new().backup().build();
 
@@ -1345,11 +1334,12 @@ mod tests {
     #[test]
     fn handles_request_invalid_view_sent_by_client() {
         // given
+        let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
             view: 1,
             request_number: 1,
             client_id: 1,
-            operation: 0,
+            operation,
         });
         let mut replica = MockReplicaBuilder::new().build();
 
@@ -1363,6 +1353,7 @@ mod tests {
     #[test]
     fn handles_prepare() {
         // given
+        let operation = usize_as_bytes(0);
         let prepare = Message::Prepare(PrepareMessage {
             view: 0,
             operation_number: 1,
@@ -1371,7 +1362,7 @@ mod tests {
                 view: 0,
                 request_number: 1,
                 client_id: 1,
-                operation: 0,
+                operation,
             },
         });
         let mut replica = MockReplicaBuilder::new().backup().build();
@@ -1399,7 +1390,7 @@ mod tests {
 
         // log is correct
         let mut log = Log::new();
-        log.append(0, 1, 1);
+        log.append(operation, 1, 1);
         assert_eq!(replica.log, log);
 
         // client table is correct
@@ -1417,6 +1408,7 @@ mod tests {
     #[test]
     fn handles_prepare_triggers_state_transfer() {
         // given
+        let operation = usize_as_bytes(1);
         let prepare = Message::Prepare(PrepareMessage {
             view: 0,
             operation_number: 2,
@@ -1425,11 +1417,11 @@ mod tests {
                 view: 0,
                 request_number: 2,
                 client_id: 1,
-                operation: 1,
+                operation,
             },
         });
         let mut replica = MockReplicaBuilder::new().backup().build();
-        replica.log.append(0, 1, 1);
+        replica.log.append(operation, 1, 1);
 
         // when
         let result = replica.handle_message(prepare);
@@ -1458,7 +1450,7 @@ mod tests {
             client_id: 1,
         });
         let mut replica = MockReplicaBuilder::new().build();
-        let operation = 0;
+        let operation = usize_as_bytes(0);
         replica.log.append(operation, 1, 1);
         replica.client_table.insert(
             1,
@@ -1484,7 +1476,7 @@ mod tests {
                 ReplyMessage {
                     view: 0,
                     request_number: 1,
-                    result: MockService.execute(&operation).unwrap(),
+                    result: usize_as_bytes(1),
                 },
                 1
             ))
@@ -1503,7 +1495,7 @@ mod tests {
             1,
             ClientTableEntry {
                 request_number: 1,
-                response: Some(MockService.execute(&operation).unwrap()),
+                response: Some(usize_as_bytes(1)),
             },
         );
         assert_eq!(replica.client_table, client_table);
@@ -1519,7 +1511,7 @@ mod tests {
             client_id: 1,
         });
         let mut replica = MockReplicaBuilder::new().total(5).build();
-        let operation = 0;
+        let operation = usize_as_bytes(0);
         replica.log.append(operation, 1, 1);
         replica.client_table.insert(
             1,
@@ -1557,8 +1549,8 @@ mod tests {
         let mut replica = MockReplicaBuilder::new().backup().build();
         replica.operation_number = 2;
         replica.commit_number = 0;
-        replica.log.append(0, 1, 1);
-        replica.log.append(1, 2, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
+        replica.log.append(usize_as_bytes(1), 2, 1);
 
         // when
         let result = replica.handle_message(commit);
@@ -1612,9 +1604,9 @@ mod tests {
         let mut replica = MockReplicaBuilder::new().backup().build();
         replica.operation_number = 3;
         replica.commit_number = 2;
-        replica.log.append(0, 1, 1);
-        replica.log.append(1, 2, 1);
-        replica.log.append(2, 3, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
+        replica.log.append(usize_as_bytes(1), 2, 1);
+        replica.log.append(usize_as_bytes(2), 3, 1);
 
         // when
         let result = replica.handle_message(get_state);
@@ -1630,12 +1622,12 @@ mod tests {
                             LogEntry {
                                 request_number: 2,
                                 client_id: 1,
-                                operation: 1,
+                                operation: usize_as_bytes(1),
                             },
                             LogEntry {
                                 request_number: 3,
                                 client_id: 1,
-                                operation: 2,
+                                operation: usize_as_bytes(2),
                             },
                         ]),
                     },
@@ -1657,12 +1649,12 @@ mod tests {
                     LogEntry {
                         request_number: 2,
                         client_id: 1,
-                        operation: 1,
+                        operation: usize_as_bytes(1),
                     },
                     LogEntry {
                         request_number: 3,
                         client_id: 1,
-                        operation: 2,
+                        operation: usize_as_bytes(2),
                     },
                 ]),
             },
@@ -1670,7 +1662,7 @@ mod tests {
             commit_number: 2,
         });
         let mut replica = MockReplicaBuilder::new().backup().build();
-        replica.log.append(0, 1, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
         replica.operation_number = 1;
 
         // when
@@ -1685,9 +1677,9 @@ mod tests {
 
         // log is correct
         let mut log = Log::new();
-        log.append(0, 1, 1);
-        log.append(1, 2, 1);
-        log.append(2, 3, 1);
+        log.append(usize_as_bytes(0), 1, 1);
+        log.append(usize_as_bytes(1), 2, 1);
+        log.append(usize_as_bytes(2), 3, 1);
         assert_eq!(replica.log, log);
     }
 
@@ -1742,7 +1734,7 @@ mod tests {
         });
         let mut replica = MockReplicaBuilder::new().build();
         replica.operation_number = 1;
-        replica.log.append(0, 1, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
 
         // when
         let result = replica.handle_message(start_view_change);
@@ -1758,7 +1750,7 @@ mod tests {
                         entries: vec![LogEntry {
                             request_number: 1,
                             client_id: 1,
-                            operation: 0,
+                            operation: usize_as_bytes(0),
                         }],
                     },
                     operation_number: 1,
@@ -1784,7 +1776,7 @@ mod tests {
         let mut replica = MockReplicaBuilder::new().backup().build();
         replica.view = 0;
         replica.operation_number = 1;
-        replica.log.append(0, 1, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
 
         // when
         let result = replica.handle_message(start_view_change);
@@ -1808,7 +1800,7 @@ mod tests {
                     entries: vec![LogEntry {
                         request_number: 1,
                         client_id: 1,
-                        operation: 0,
+                        operation: usize_as_bytes(0),
                     }],
                 },
             }]
@@ -1819,8 +1811,8 @@ mod tests {
     fn handles_do_view_change() {
         // given
         let mut message_log = Log::new();
-        message_log.append(0, 1, 1);
-        message_log.append(1, 2, 1);
+        message_log.append(usize_as_bytes(0), 1, 1);
+        message_log.append(usize_as_bytes(1), 2, 1);
         let do_view_change = Message::DoViewChange(DoViewChangeMessage {
             old_view: 0,
             new_view: 1,
@@ -1839,12 +1831,12 @@ mod tests {
                 entries: vec![LogEntry {
                     request_number: 1,
                     client_id: 1,
-                    operation: 0,
+                    operation: usize_as_bytes(0),
                 }],
             },
         }]);
         replica.operation_number = 1;
-        replica.log.append(0, 1, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
 
         // when
         let result = replica.handle_message(do_view_change);
@@ -1857,7 +1849,7 @@ mod tests {
                     message: ReplyMessage {
                         view: 1,
                         request_number: 2,
-                        result: 2
+                        result: usize_as_bytes(2),
                     },
                     client_id: 1
                 },
@@ -1882,7 +1874,7 @@ mod tests {
                 1,
                 ClientTableEntry {
                     request_number: 2,
-                    response: Some(2)
+                    response: Some(usize_as_bytes(2))
                 }
             )])
         );
@@ -1892,8 +1884,8 @@ mod tests {
     fn handles_do_view_change_waits_for_quorum() {
         // given
         let mut message_log = Log::new();
-        message_log.append(0, 1, 1);
-        message_log.append(1, 2, 1);
+        message_log.append(usize_as_bytes(0), 1, 1);
+        message_log.append(usize_as_bytes(1), 2, 1);
         let do_view_change = Message::DoViewChange(DoViewChangeMessage {
             old_view: 0,
             new_view: 1,
@@ -1927,8 +1919,8 @@ mod tests {
     fn handles_start_view() {
         // given
         let mut message_log = Log::new();
-        message_log.append(0, 1, 1);
-        message_log.append(1, 2, 1);
+        message_log.append(usize_as_bytes(0), 1, 1);
+        message_log.append(usize_as_bytes(1), 2, 1);
         let start_view = Message::StartView(StartViewMessage {
             view: 1,
             log: message_log.clone(),
@@ -1939,7 +1931,7 @@ mod tests {
         let mut replica = MockReplicaBuilder::new().build();
         replica.view = 0;
         replica.operation_number = 1;
-        replica.log.append(0, 1, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
 
         // when
         let result = replica.handle_message(start_view);
@@ -1970,7 +1962,7 @@ mod tests {
                 1,
                 ClientTableEntry {
                     request_number: 2,
-                    response: Some(2)
+                    response: Some(usize_as_bytes(2))
                 }
             )])
         );
@@ -2014,8 +2006,8 @@ mod tests {
         replica.view = 0;
         replica.commit_number = 1;
         replica.operation_number = 2;
-        replica.log.append(0, 1, 1);
-        replica.log.append(1, 2, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
+        replica.log.append(usize_as_bytes(1), 2, 1);
 
         // when
         let result = replica.handle_message(recovery);
@@ -2049,8 +2041,8 @@ mod tests {
         replica.view = 0;
         replica.commit_number = 1;
         replica.operation_number = 2;
-        replica.log.append(0, 1, 1);
-        replica.log.append(1, 2, 1);
+        replica.log.append(usize_as_bytes(0), 1, 1);
+        replica.log.append(usize_as_bytes(1), 2, 1);
 
         // when
         let result = replica.handle_message(recovery);
@@ -2073,8 +2065,8 @@ mod tests {
     fn handles_recovery_response() {
         // given
         let mut log = Log::new();
-        log.append(0, 1, 1);
-        log.append(1, 2, 1);
+        log.append(usize_as_bytes(0), 1, 1);
+        log.append(usize_as_bytes(1), 2, 1);
 
         let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
             view: 2,
@@ -2093,7 +2085,7 @@ mod tests {
                     entries: vec![LogEntry {
                         request_number: 1,
                         client_id: 1,
-                        operation: 0,
+                        operation: usize_as_bytes(0),
                     }],
                 },
                 operation_number: 1,
@@ -2124,7 +2116,7 @@ mod tests {
                 1,
                 ClientTableEntry {
                     request_number: 1,
-                    response: Some(1)
+                    response: Some(usize_as_bytes(1))
                 }
             )])
         );
@@ -2135,8 +2127,8 @@ mod tests {
     fn handles_recovery_response_waits_for_quorum() {
         // given
         let mut log = Log::new();
-        log.append(0, 1, 1);
-        log.append(1, 2, 1);
+        log.append(usize_as_bytes(0), 1, 1);
+        log.append(usize_as_bytes(1), 2, 1);
 
         let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
             view: 2,
@@ -2176,8 +2168,8 @@ mod tests {
     fn handles_recovery_response_waits_for_primary_ack() {
         // given
         let mut log = Log::new();
-        log.append(0, 1, 1);
-        log.append(1, 2, 1);
+        log.append(usize_as_bytes(0), 1, 1);
+        log.append(usize_as_bytes(1), 2, 1);
 
         let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
             view: 2,

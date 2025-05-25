@@ -1,8 +1,9 @@
 use std::{collections::HashMap, net::AddrParseError};
 
+use bincode::{Decode, Encode};
 use client::Client;
 use crossbeam::channel::unbounded;
-use network::{AttachedChannel, ClientConnection, Message, ReplicaNetwork};
+use network::{AttachedChannel, ClientConnection, Message, Operation, ReplicaNetwork};
 use replica::{Replica, ReplicaConfig, quorum};
 use thiserror::Error;
 
@@ -69,10 +70,11 @@ pub mod bus;
 mod client;
 pub mod clock;
 pub mod io;
-mod network;
+pub mod network;
 pub mod replica;
 
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
+pub(crate) const OPERATION_SIZE_MAX: usize = 1024;
 
 pub struct Config {
     pub current: usize,
@@ -94,15 +96,15 @@ impl Cluster {
             addresses: socket_addresses,
         })
     }
-    pub fn create<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send>(
+    pub fn create<S: Clone + Service<Input = I, Output = O>, I: Decode<()>, O: Encode>(
         config: &Config,
         service: S,
-    ) -> Vec<Replica<S, ReplicaNetwork<I, O>, I, O>> {
+    ) -> Vec<Replica<S, ReplicaNetwork>> {
         let total = config.addresses.len();
 
         let mut channels = Vec::with_capacity(total);
         for _ in &config.addresses {
-            channels.push(unbounded::<Message<I>>())
+            channels.push(unbounded::<Message>())
         }
 
         let mut replicas = Vec::with_capacity(total);
@@ -118,13 +120,7 @@ impl Cluster {
         replicas
     }
 
-    pub fn handshake<
-        S: Clone + Service<Input = I, Output = O>,
-        I: Clone + Send,
-        O: Clone + Send,
-    >(
-        replicas: &mut Vec<Replica<S, ReplicaNetwork<I, O>, I, O>>,
-    ) -> Client<I, O> {
+    pub fn handshake<S: Service>(replicas: &mut Vec<Replica<S, ReplicaNetwork>>) -> Client {
         let primary = Self::primary(replicas);
 
         let replica = replicas.get_mut(primary).expect("Primary index not valid");
@@ -133,9 +129,7 @@ impl Cluster {
         Client::new(client_id, replica.view, channel)
     }
 
-    fn primary<S: Clone + Service<Input = I, Output = O>, I: Clone + Send, O: Clone + Send>(
-        replicas: &Vec<Replica<S, ReplicaNetwork<I, O>, I, O>>,
-    ) -> usize {
+    fn primary<S: Service>(replicas: &Vec<Replica<S, ReplicaNetwork>>) -> usize {
         assert!(!replicas.is_empty());
 
         let total = replicas.len();
@@ -174,8 +168,27 @@ pub enum ServiceError {
 }
 
 pub trait Service {
-    type Input;
-    type Output;
+    type Input: Decode<()>;
+    type Output: Encode;
 
-    fn execute(&self, input: &Self::Input) -> Result<Self::Output, ServiceError>;
+    fn execute(&self, input: Self::Input) -> Result<Self::Output, ServiceError>;
+
+    fn execute_bytes(&self, input: &[u8]) -> Result<Operation, ServiceError> {
+        let input = decode(input);
+        let output = self.execute(input)?;
+
+        Ok(encode(output))
+    }
+}
+
+fn encode<T: Encode>(value: T) -> Operation {
+    let mut buf = [0; OPERATION_SIZE_MAX];
+    bincode::encode_into_slice(value, &mut buf, bincode::config::standard()).unwrap(); // TODO: handle this
+
+    buf
+}
+
+fn decode<T: Decode<()>>(value: &[u8]) -> T {
+    let (result, _) = bincode::decode_from_slice(value, bincode::config::standard()).unwrap(); // TODO: handle this
+    result
 }
