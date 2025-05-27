@@ -93,6 +93,36 @@ impl Connection {
     }
 }
 
+#[derive(Debug, Default)]
+struct ConnectionPool {
+    connections: Vec<Connection>,
+}
+
+impl ConnectionPool {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn next_id(&self) -> usize {
+        self.connections.len() + 1
+    }
+
+    fn add(&mut self, connection: Connection) -> usize {
+        let id = self.next_id();
+        self.connections.push(connection);
+
+        id
+    }
+
+    fn get_mut(&mut self, connection_id: usize) -> Option<&mut Connection> {
+        self.connections.get_mut(connection_id - 1)
+    }
+
+    fn remove(&mut self, connection_id: usize) -> Connection {
+        self.connections.remove(connection_id - 1)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ConnectionStatus {
     Connected,
@@ -103,7 +133,7 @@ enum ConnectionStatus {
 pub struct MessageBus<I: IO> {
     address: SocketAddr,
     socket: Option<TcpListener>, // TODO: Define this as a connection?
-    connections: Vec<Connection>,
+    connections: ConnectionPool,
     replicas: HashMap<usize, usize>,
     connect_retry: RetryInfo,
     rng: ChaCha8Rng,
@@ -115,16 +145,14 @@ impl<I: IO> MessageBus<I> {
     pub fn new(config: &ReplicaConfig, io: I, seed: u64) -> std::io::Result<Self> {
         let current_address = config.addresses.get(config.replica).unwrap();
 
-        let mut connections = Vec::new();
+        let mut connections = ConnectionPool::new();
         let mut replicas = HashMap::with_capacity(config.addresses.len() - 1);
         let mut connect_attempts = HashMap::with_capacity(config.addresses.len() - 1);
 
         for (replica, address) in config.addresses.iter().enumerate() {
             if replica != config.replica {
-                let index = connections.len();
-
-                connections.push(Connection::new(*address));
-                replicas.insert(replica, index);
+                let connection_id = connections.add(Connection::new(*address));
+                replicas.insert(replica, connection_id);
                 connect_attempts.insert(replica, 0);
             }
         }
@@ -228,9 +256,10 @@ impl<I: IO> MessageBus<I> {
             .as_mut()
             .expect("Replica socket not available while accepting new connections");
 
-        let connection_id = self.connections.len();
-
-        let socket = self.io.accept(socket, connection_id)?;
+        let connection_id = self.connections.next_id();
+        let Some(socket) = self.io.accept(socket, connection_id)? else {
+            return Ok(());
+        };
 
         let connection = Connection {
             address: socket.peer_addr()?,
@@ -238,7 +267,7 @@ impl<I: IO> MessageBus<I> {
             socket: Some(socket),
         };
 
-        self.connections.push(connection);
+        self.connections.add(connection);
 
         Ok(())
     }

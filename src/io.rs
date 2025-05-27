@@ -29,7 +29,11 @@ pub trait IO {
 
     fn connect(&mut self, addr: SocketAddr, connection_id: usize) -> Result<TcpStream, IOError>;
 
-    fn accept(&mut self, socket: &TcpListener, connection_id: usize) -> Result<TcpStream, IOError>;
+    fn accept(
+        &mut self,
+        socket: &TcpListener,
+        connection_id: usize,
+    ) -> Result<Option<TcpStream>, IOError>;
 
     fn recv(&self, socket: &mut TcpStream, connection_id: usize) -> Result<RecvBody, IOError>;
 
@@ -79,15 +83,22 @@ impl IO for PollIO {
         }
     }
 
-    fn accept(&mut self, socket: &TcpListener, connection_id: usize) -> Result<TcpStream, IOError> {
+    fn accept(
+        &mut self,
+        socket: &TcpListener,
+        connection_id: usize,
+    ) -> Result<Option<TcpStream>, IOError> {
+        assert!(connection_id != SERVER);
+
         match socket.accept() {
             Ok((stream, _)) => {
                 unsafe {
                     self.poll.add(&stream, Event::all(connection_id))?;
                 }
 
-                Ok(stream)
+                Ok(Some(stream))
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e)?,
         }
     }
