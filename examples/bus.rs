@@ -1,22 +1,24 @@
 use vsr::{
-    Cluster, Config,
-    bus::MessageBus,
+    ReplicaOptions,
+    bus::ReplicaMessageBus,
     io::{IOError, PollIO},
-    network::{Message, Operation, RequestMessage},
+    message::{Message, Operation, RequestMessage},
 };
 
-fn init_bus(replica: usize, seed: u64) -> MessageBus<PollIO> {
+fn init_bus(replica: usize, seed: u64) -> ReplicaMessageBus<PollIO> {
     let addresses = vec!["127.0.0.1:3000".to_string(), "127.0.0.1:3001".to_string()];
 
-    let config = Cluster::parse_config(&Config {
+    let config = ReplicaOptions {
+        seed,
         addresses,
         current: replica,
-    })
+    }
+    .parse()
     .unwrap();
 
     let io = PollIO::new().unwrap();
 
-    let mut bus = MessageBus::new(&config, io, seed).unwrap();
+    let mut bus = ReplicaMessageBus::new(&config, io);
     bus.init().unwrap();
 
     bus
@@ -54,7 +56,7 @@ fn main() -> Result<(), IOError> {
                     operation,
                 });
                 println!("message sent from replica 0: {:?}", greeting);
-                bus.send(1, message).unwrap();
+                bus.send_to_replica(message, &1).unwrap();
                 count = 0;
                 request += 1;
             }
@@ -88,7 +90,7 @@ fn main() -> Result<(), IOError> {
                 operation,
             });
             println!("message sent from replica 1: {:?}", greeting);
-            bus.send(0, message).unwrap();
+            bus.send_to_replica(message, &0).unwrap();
             count = 0;
             request += 1;
         }
