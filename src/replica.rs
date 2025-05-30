@@ -13,7 +13,7 @@ use crate::{
     bus::ReplicaMessageBus,
     clock::Timeout,
     io::IOError,
-    network::{
+    message::{
         CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
         PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
         RecoveryResponseMessage, ReplyMessage, RequestMessage, StartViewChangeMessage,
@@ -1138,7 +1138,7 @@ mod tests {
         Operation, ReplicaOptions,
         bus::ReplicaMessageBus,
         io::{AcceptedConnection, IO},
-        network::{
+        message::{
             CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
             PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
             RecoveryResponseMessage, ReplyMessage, RequestMessage, StartViewChangeMessage,

@@ -7,7 +7,7 @@ use crate::{
     ClientOptions, InputError, OPERATION_SIZE_MAX,
     bus::ClientMessageBus,
     io::{IOError, PollIO},
-    network::{Message, RequestMessage},
+    message::{Message, RequestMessage},
 };
 
 #[derive(Debug, Clone, PartialEq)]

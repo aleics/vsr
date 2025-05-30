@@ -4,7 +4,7 @@ use bincode::{Decode, Encode};
 use bus::ReplicaMessageBus;
 use client::ClientConfig;
 use io::{IOError, PollIO};
-use network::Operation;
+use message::Operation;
 use replica::{Replica, ReplicaConfig, ReplicaError, quorum};
 use thiserror::Error;
 
@@ -71,7 +71,7 @@ pub mod bus;
 pub mod client;
 pub mod clock;
 pub mod io;
-pub mod network;
+pub mod message;
 pub mod replica;
 
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;

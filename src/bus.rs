@@ -8,7 +8,7 @@ use std::{cmp, collections::HashMap, time::Duration};
 
 use crate::client::ClientConfig;
 use crate::io::IOError;
-use crate::network::{
+use crate::message::{
     CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
     PrepareOkMessage, RecoveryMessage, RecoveryResponseMessage, ReplyMessage,
     StartViewChangeMessage, StartViewMessage,
