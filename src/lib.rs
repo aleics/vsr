@@ -1,11 +1,11 @@
 use std::{collections::HashMap, net::AddrParseError};
 
 use bincode::{Decode, Encode};
-use client::Client;
-use crossbeam::channel::unbounded;
-use io::IOError;
-use network::{AttachedChannel, ClientConnection, Message, Operation, ReplicaNetwork};
-use replica::{Replica, ReplicaConfig, quorum};
+use bus::ReplicaMessageBus;
+use client::ClientConfig;
+use io::{IOError, PollIO};
+use network::Operation;
+use replica::{Replica, ReplicaConfig, ReplicaError, quorum};
 use thiserror::Error;
 
 /* VSR (Viewstamped Replication Revisited)
@@ -68,7 +68,7 @@ Recovery protocol
 */
 
 pub mod bus;
-mod client;
+pub mod client;
 pub mod clock;
 pub mod io;
 pub mod network;
@@ -77,60 +77,68 @@ pub mod replica;
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
 pub(crate) const OPERATION_SIZE_MAX: usize = 1024;
 
-pub struct Config {
+pub struct ReplicaOptions {
+    pub seed: u64,
     pub current: usize,
     pub addresses: Vec<String>,
+}
+
+impl ReplicaOptions {
+    pub fn parse(&self) -> Result<ReplicaConfig, InputError> {
+        let mut socket_addresses = Vec::with_capacity(self.addresses.len());
+        for address in &self.addresses {
+            socket_addresses.push(address.parse()?)
+        }
+
+        Ok(ReplicaConfig {
+            seed: self.seed,
+            replica: self.current,
+            total: socket_addresses.len(),
+            addresses: socket_addresses,
+        })
+    }
+}
+
+pub struct ClientOptions {
+    pub seed: u64,
+    pub address: String,
+    pub client_id: usize,
+    pub replicas: Vec<String>,
+}
+
+impl ClientOptions {
+    fn parse(&self) -> Result<ClientConfig, InputError> {
+        let mut socket_addresses = Vec::with_capacity(self.replicas.len());
+        for address in &self.replicas {
+            socket_addresses.push(address.parse()?)
+        }
+
+        Ok(ClientConfig {
+            seed: self.seed,
+            address: self.address.parse()?,
+            client_id: self.client_id,
+            replicas: socket_addresses,
+        })
+    }
 }
 
 pub struct Cluster;
 
 impl Cluster {
-    pub fn parse_config(config: &Config) -> Result<ReplicaConfig, InputError> {
-        let mut socket_addresses = Vec::with_capacity(config.addresses.len());
-        for address in &config.addresses {
-            socket_addresses.push(address.parse()?)
-        }
-
-        Ok(ReplicaConfig {
-            replica: config.current,
-            total: socket_addresses.len(),
-            addresses: socket_addresses,
-        })
-    }
-    pub fn create<S: Clone + Service<Input = I, Output = O>, I: Decode<()>, O: Encode>(
-        config: &Config,
+    pub fn create_replica<S: Clone + Service<Input = I, Output = O>, I: Decode<()>, O: Encode>(
+        options: &ReplicaOptions,
         service: S,
-    ) -> Vec<Replica<S, ReplicaNetwork>> {
-        let total = config.addresses.len();
+    ) -> Result<Replica<S, PollIO>, ReplicaError> {
+        let total = options.addresses.len();
+        let config = options.parse().unwrap();
 
-        let mut channels = Vec::with_capacity(total);
-        for _ in &config.addresses {
-            channels.push(unbounded::<Message>())
-        }
+        let io = PollIO::new()?;
+        let bus = ReplicaMessageBus::new(&config, io);
 
-        let mut replicas = Vec::with_capacity(total);
-        for (i, _) in config.addresses.iter().enumerate() {
-            replicas.push(Replica::new(
-                i,
-                total,
-                service.clone(),
-                ReplicaNetwork::for_replica(i, ClientConnection::new(), &channels),
-            ));
-        }
-
-        replicas
+        Ok(Replica::new(config.replica, total, service.clone(), bus))
     }
 
-    pub fn handshake<S: Service>(replicas: &mut Vec<Replica<S, ReplicaNetwork>>) -> Client {
-        let primary = Self::primary(replicas);
-
-        let replica = replicas.get_mut(primary).expect("Primary index not valid");
-
-        let AttachedChannel { client_id, channel } = replica.network.client.attach();
-        Client::new(client_id, replica.view, channel)
-    }
-
-    fn primary<S: Service>(replicas: &Vec<Replica<S, ReplicaNetwork>>) -> usize {
+    pub fn primary<S, IO>(replicas: &Vec<Replica<S, IO>>) -> usize {
         assert!(!replicas.is_empty());
 
         let total = replicas.len();

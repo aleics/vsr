@@ -3,7 +3,8 @@ use std::thread::{self, sleep};
 use std::time::Duration;
 
 use bincode::{Decode, Encode};
-use vsr::{Cluster, Config, Service, ServiceError};
+use vsr::client::Client;
+use vsr::{ClientOptions, Cluster, ReplicaOptions, Service, ServiceError};
 
 #[derive(Debug)]
 struct Counter {
@@ -42,52 +43,113 @@ enum Operation {
 }
 
 fn main() {
-    let config = Config {
-        current: 0,
-        addresses: vec!["ip-1".to_string(), "ip-2".to_string(), "ip-3".to_string()],
+    let seed = 1234;
+    let replica_addresses = vec![
+        "127.0.0.1:3001".to_string(),
+        "127.0.0.1:3002".to_string(),
+        "127.0.0.1:3003".to_string(),
+    ];
+    let client_options = ClientOptions {
+        seed,
+        address: "127.0.0.1:8000".to_string(),
+        client_id: 0,
+        replicas: replica_addresses.clone(),
     };
 
-    let mut replicas = Cluster::create(
-        &config,
-        Counter {
-            value: Mutex::new(1),
-        },
-    );
-    println!("Cluster created with {} replicas.", config.addresses.len());
+    let mut handles = Vec::with_capacity(replica_addresses.len());
+    let mut replicas = Vec::with_capacity(replica_addresses.len());
 
-    let client = Cluster::handshake(&mut replicas);
+    for i in 0..replica_addresses.len() {
+        let replica_options = ReplicaOptions {
+            seed,
+            current: i,
+            addresses: replica_addresses.clone(),
+        };
 
-    let mut handles = Vec::with_capacity(replicas.len());
+        let mut replica = Cluster::create_replica(
+            &replica_options,
+            Counter {
+                value: Mutex::new(1),
+            },
+        )
+        .unwrap();
 
-    for replica in replicas {
-        handles.push(thread::spawn(move || replica.run()));
+        replica.init().unwrap();
+        replicas.push(replica);
+
+        println!("Replica {} created", i);
     }
+
+    let primary = Cluster::primary(&replicas);
+
+    for replica in replicas.into_iter() {
+        handles.push(thread::spawn(move || {
+            replica.run().unwrap();
+        }));
+    }
+
+    sleep(Duration::from_secs(1));
+
+    let mut client = Client::new(&client_options, primary).unwrap();
+
+    while !client.is_ready() {
+        let responses = client.tick::<i32>().unwrap();
+        if !responses.is_empty() {
+            println!("Received responses while getting ready: {:?}", responses);
+        }
+    }
+
+    println!("Client is ready!");
 
     client.send(Operation::AddOne).unwrap();
 
-    let result = client.recv::<i32>().unwrap();
-    println!("After plus one: {}", result);
+    loop {
+        let responses = client.tick::<i32>().unwrap();
+        if !responses.is_empty() {
+            println!("Received responses: {:?}", responses);
+            break;
+        }
+    }
 
     client.send(Operation::SubOne).unwrap();
 
-    let result = client.recv::<i32>().unwrap();
-    println!("After minus one: {}", result);
+    println!("After minus one");
+    loop {
+        let responses = client.tick::<i32>().unwrap();
+        if !responses.is_empty() {
+            println!("Received responses: {:?}", responses);
+            break;
+        }
+    }
 
     sleep(Duration::from_secs(10));
     println!("slept for 10 seconds");
 
     client.send(Operation::AddOne).unwrap();
 
-    let result = client.recv::<i32>().unwrap();
-    println!("After plus one: {}", result);
+    println!("After plus one");
+    loop {
+        let responses = client.tick::<i32>().unwrap();
+        if !responses.is_empty() {
+            println!("Received responses: {:?}", responses);
+            break;
+        }
+    }
 
     sleep(Duration::from_secs(1));
     println!("slept for 1 seconds");
 
     client.send(Operation::SubOne).unwrap();
 
-    let result = client.recv::<i32>().unwrap();
-    println!("After minus one: {}", result);
+    println!("After minus one:");
+
+    loop {
+        let responses = client.tick::<i32>().unwrap();
+        if !responses.is_empty() {
+            println!("Received responses: {:?}", responses);
+            break;
+        }
+    }
 
     for handle in handles {
         handle.join().unwrap();
