@@ -19,58 +19,102 @@ use crate::{
     io::{Completion, IO},
 };
 
+/// The identifier used by the retry timeout used for connecting
+/// to replicas / clients.
 const CONNECT_RETRY_TIMEOUT_ID: &str = "connect_retry_timeout";
+
+/// Minimum delay (ticks) used by the retry timeout.
 const CONNECT_DELAY_MIN: u64 = 50;
+
+/// Maximum delay (ticks) used by the retry timeout.
 const CONNECT_DELAY_MAX: u64 = 1000;
 
+/// Timeout (nanoseconds) for the IO tick iteration.
+const TICK_TIMEOUT_NS: u64 = 200;
+
+/// `RetryTimeout` defines a retry strategy and collects the timeout strategy,
+/// as well as the amount of attempts for a given replica.
 #[derive(Debug)]
-struct RetryInfo {
-    attempts: HashMap<usize, u32>,
-    timeout: Timeout,
+struct RetryTimeout {
+    /// Contains the amount of attempts for each replica, along with
+    /// its associated timeout
+    attempts: HashMap<usize, (u32, Timeout)>,
 }
 
-impl RetryInfo {
-    fn start(id: &str, after: u64, attempts: HashMap<usize, u32>) -> Self {
-        let mut timeout = Timeout::new(id, after);
-        timeout.start();
+impl RetryTimeout {
+    /// Create a new retry timeout. The `id` identifies the retry timeout.
+    /// `after` defines the amount of ticks the timeout should use.
+    /// `attempts` defines the
+    fn new(id: &str, after: u64, replicas: Vec<usize>) -> Self {
+        let attempts = replicas
+            .into_iter()
+            .map(|replica| {
+                (
+                    replica,
+                    (0, Timeout::new(&format!("{id}_{replica}"), after)),
+                )
+            })
+            .collect();
 
-        RetryInfo { attempts, timeout }
+        RetryTimeout { attempts }
     }
 
+    /// Start the retry timeout for all replicas
+    fn init(&mut self) {
+        for (_, timeout) in self.attempts.values_mut() {
+            timeout.start();
+        }
+    }
+
+    /// Tick the timeout for all replicas a single time.
     fn tick(&mut self) {
-        self.timeout.tick();
+        for (_, timeout) in self.attempts.values_mut() {
+            timeout.tick();
+        }
     }
 
-    fn retry(&self, replica: &usize) -> bool {
-        let attempts = self.attempts.get(replica).copied().unwrap_or_default();
-        if attempts == 0 {
+    /// Check if a given replica should try another attempt.
+    /// In case no attempts have been tried yet, it returns `true`.
+    fn should_retry(&self, replica: usize) -> bool {
+        let Some((attempts, timeout)) = self.attempts.get(&replica) else {
+            return false;
+        };
+
+        if attempts == &0 {
             return true;
         }
 
-        self.timeout.fired()
+        timeout.fired()
     }
 
+    /// Reset the retry timeout used by a given replica.
     fn reset(&mut self, replica: usize) {
-        let attempts = self.attempts.entry(replica).or_default();
-        *attempts = 0;
-        self.timeout.reset();
+        if let Some((attempts, timeout)) = self.attempts.get_mut(&replica) {
+            *attempts = 0;
+            timeout.reset();
+        }
     }
 
+    /// Increase the retry timeout of a given replica using exponential
+    /// backoff with jitter defined by `rng`.
     fn increase(&mut self, replica: usize, rng: &mut ChaCha8Rng) {
-        let attempts = self.attempts.entry(replica).or_default();
+        let Some((attempts, timeout)) = self.attempts.get_mut(&replica) else {
+            return;
+        };
+
         *attempts += 1;
 
         let after = compute_jittered_backoff(*attempts, CONNECT_DELAY_MIN, CONNECT_DELAY_MAX, rng);
 
-        self.timeout.increase(after);
-        self.timeout.reset();
+        timeout.increase(after);
+        timeout.reset();
     }
 }
 
 fn compute_jittered_backoff(attempt: u32, min: u64, max: u64, rng: &mut ChaCha8Rng) -> u64 {
     assert!(max > min);
 
-    let base = cmp::max(1, min) as u128;
+    let base = u128::from(cmp::max(1, min));
     let exponent = attempt.min(63); // Saturate exponent to u6 equivalent (max 63)
 
     // backoff = min(cap, base * 2 ^ attempt)
@@ -78,7 +122,7 @@ fn compute_jittered_backoff(attempt: u32, min: u64, max: u64, rng: &mut ChaCha8R
         .checked_shl(exponent)
         .expect("overflow in 1 << attempt");
 
-    let backoff = base.saturating_mul(power).min((max - min) as u128);
+    let backoff = base.saturating_mul(power).min(u128::from(max - min));
     let jitter = rng.random_range(0..=backoff) as u64;
 
     let result = min + jitter;
@@ -89,27 +133,8 @@ fn compute_jittered_backoff(attempt: u32, min: u64, max: u64, rng: &mut ChaCha8R
     result
 }
 
-fn encode_message(message: &Message, config: Configuration) -> Vec<u8> {
-    let encoded = bincode::encode_to_vec(message, config).unwrap();
-    let mut frame = (encoded.len() as u32).to_be_bytes().to_vec();
-    frame.extend_from_slice(&encoded);
-    frame
-}
-
-fn decode_message(buf: &mut Vec<u8>) -> Option<Message> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + len {
-        return None;
-    }
-    let msg_bytes = &buf[4..4 + len];
-    let (msg, _) = bincode::decode_from_slice(msg_bytes, bincode::config::standard()).ok()?;
-    buf.drain(..4 + len);
-    Some(msg)
-}
-
+/// The `OutgoingQueue` is used to collect all the messages meant
+/// to be sent over to another replica / client.
 #[derive(Debug, Default)]
 struct OutgoingBuffer {
     pub(crate) send_queue: VecDeque<Vec<u8>>,
@@ -119,20 +144,46 @@ impl OutgoingBuffer {
     fn new() -> Self {
         OutgoingBuffer::default()
     }
+
+    /// Add a message in the outgoing buffer's queue.
+    fn add(&mut self, message_bytes: Vec<u8>) {
+        self.send_queue.push_back(message_bytes);
+    }
+
+    /// Pop out the first message from the queue.
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        self.send_queue.pop_front()
+    }
 }
 
+/// A `Connection` describes the connection between replicas / clients.
 struct Connection {
+    /// The target address of the connection.
     address: SocketAddr,
+
+    /// The status of the connection.
     status: ConnectionStatus,
+
+    /// The socket used to communicate to the target replica / client.
     socket: Option<TcpStream>,
+
+    /// The connection peer identifying the target.
     peer: Option<ConnectionPeer>,
+
+    /// The outgoing buffer of the connection where message to the target
+    /// are queued.
     outgoing_buffer: OutgoingBuffer,
+
+    /// The incoming buffer for message coming from the target.
     incoming_buffer: Vec<u8>,
-    config: Configuration,
+
+    /// The `bincode` configuration used to encode / decode messages.
+    encoding_config: Configuration,
 }
 
 impl Connection {
-    fn new(address: SocketAddr) -> Self {
+    /// Create a new connection without a peer.
+    fn new(address: SocketAddr, config: Configuration) -> Self {
         Connection {
             address,
             status: ConnectionStatus::Free,
@@ -140,10 +191,11 @@ impl Connection {
             peer: None,
             outgoing_buffer: OutgoingBuffer::new(),
             incoming_buffer: Vec::new(),
-            config: bincode::config::standard(),
+            encoding_config: config,
         }
     }
 
+    /// Sets the peer of the connection given a received message.
     fn set_message_peer(&mut self, message: &Message) -> &ConnectionPeer {
         let peer = ConnectionPeer::from_message(message);
         self.peer = Some(peer);
@@ -151,12 +203,16 @@ impl Connection {
         self.peer.as_ref().unwrap()
     }
 
-    fn queue_message(&mut self, message: &Message) {
-        let buf = encode_message(message, self.config);
-        self.outgoing_buffer.send_queue.push_back(buf);
+    /// Queue a new message into the outgoing buffer
+    fn queue_message(&mut self, message: &Message) -> Result<(), IOError> {
+        let buffer = message.encode(self.encoding_config)?;
+        self.outgoing_buffer.add(buffer);
+
+        Ok(())
     }
 }
 
+/// A `ConnectionPeer` describes what type of node is a connection connected to.
 #[derive(Debug)]
 enum ConnectionPeer {
     Client { id: usize },
@@ -165,6 +221,7 @@ enum ConnectionPeer {
 }
 
 impl ConnectionPeer {
+    /// Guess what type of connection peer a message should be coming from.
     fn from_message(message: &Message) -> ConnectionPeer {
         match message {
             Message::Request(request) => ConnectionPeer::Client {
@@ -188,44 +245,56 @@ impl ConnectionPeer {
     }
 }
 
+/// A pool of connections available in a message bus.
 #[derive(Default)]
 struct ConnectionPool {
     connections: Vec<Connection>,
 }
 
 impl ConnectionPool {
+    /// Create an empty connection pool
     fn new() -> Self {
         Self::default()
     }
 
+    /// Determine what the next connection identifier must be
+    /// given the existing connections.
     fn next_id(&self) -> usize {
         self.connections.len() + 1
     }
 
+    /// Size of the connection pool
     fn size(&self) -> usize {
         self.connections.len()
     }
 
+    /// Adds a new connection to the pool
     fn add(&mut self, connection: Connection) -> usize {
         let id = self.next_id();
         self.connections.push(connection);
 
+        assert!(id == self.size());
+
         id
     }
 
-    fn get(&self, connection_id: &usize) -> Option<&Connection> {
+    /// Get a connection given an identifier
+    fn get(&self, connection_id: usize) -> Option<&Connection> {
         self.connections.get(connection_id - 1)
     }
 
-    fn get_mut(&mut self, connection_id: &usize) -> Option<&mut Connection> {
+    /// Get a mutable reference to a connection given an identifier
+    fn get_mut(&mut self, connection_id: usize) -> Option<&mut Connection> {
         self.connections.get_mut(connection_id - 1)
     }
 
+    /// Removes a connection from the pool given its identifier.
     fn remove(&mut self, connection_id: usize) -> Connection {
         self.connections.remove(connection_id - 1)
     }
 }
 
+/// The status of a connection.
 #[derive(Debug, PartialEq)]
 enum ConnectionStatus {
     Connected,
@@ -233,55 +302,90 @@ enum ConnectionStatus {
     Free,
 }
 
-pub struct ReplicaMessageBus<I> {
+/// The message bus used by the replicas. The bus is in charge of accepting and
+/// closing connections to the source replica, as well as sending and receiving
+/// messages from other replicas and clients.
+pub struct ReplicaMessageBus<IO> {
     address: SocketAddr,
-    socket: Option<TcpListener>, // TODO: Define this as a connection?
+
+    /// The socket used to listen for messages.
+    socket: Option<TcpListener>,
+
+    /// The connection pool of the replica bus.
     connection_pool: ConnectionPool,
-    current: usize,
+
+    /// The current replica's identifier.
+    replica: usize,
+
+    /// A key-value map identifying each connected replica to the associated
+    /// connection identifier.
     replicas: HashMap<usize, usize>,
+
+    /// A key-value map identifying each connected client to the associated
+    /// connection identifier.
     clients: HashMap<usize, usize>,
-    connect_retry: RetryInfo,
+
+    /// A retry timeout used for connecting to other replicas.
+    connect_retry: RetryTimeout,
+
+    /// A random generator used by the connect retry timeout.
     rng: ChaCha8Rng,
-    io: I,
+
+    /// The IO object used to read / write messages from the connections.
+    io: IO,
+
+    /// The `bincode` configuration used to encode / decode messages.
+    encoding_config: Configuration,
 }
 
 impl<I: IO> ReplicaMessageBus<I> {
+    /// Create a new instance of a message bus for the local replica.
     pub fn new(config: &ReplicaConfig, io: I) -> Self {
         let current_address = config.addresses.get(config.replica).unwrap();
+        let encoding_config = bincode::config::standard();
 
         let mut connections = ConnectionPool::new();
         let mut replicas = HashMap::with_capacity(config.addresses.len() - 1);
-        let mut connect_attempts = HashMap::with_capacity(config.addresses.len() - 1);
+        let mut connect_attempts = Vec::with_capacity(config.addresses.len() - config.replica + 1);
 
+        // Create a fix amount of connection to the other replicas.
+        // It will connect to the next replicas as defined in the configuration to prevent conflicts.
         for replica in (config.replica + 1)..config.addresses.len() {
             let address = config.addresses.get(replica).unwrap();
-            let connection_id = connections.add(Connection::new(*address));
+            let connection_id = connections.add(Connection::new(*address, encoding_config));
             replicas.insert(replica, connection_id);
-            connect_attempts.insert(replica, 0);
+            connect_attempts.push(replica);
         }
 
         ReplicaMessageBus {
             address: *current_address,
             socket: None,
             connection_pool: connections,
-            current: config.replica,
+            replica: config.replica,
             replicas,
             clients: HashMap::new(),
-            connect_retry: RetryInfo::start(
+            connect_retry: RetryTimeout::new(
                 CONNECT_RETRY_TIMEOUT_ID,
                 CONNECT_DELAY_MIN,
                 connect_attempts,
             ),
             rng: ChaCha8Rng::seed_from_u64(config.seed),
             io,
+            encoding_config,
         }
     }
 
+    /// Initialize the bus and open a TCP address to allow incoming
+    /// connections.
     pub fn init(&mut self) -> Result<(), IOError> {
         self.socket = Some(self.io.open_tcp(self.address)?);
+        self.connect_retry.init();
         Ok(())
     }
 
+    /// Run any pending IO operations with a given timeout in nanoseconds.
+    /// All the operations will be executed and in case any incoming message
+    /// has been received, it will be returned.
     fn run_for_ns(&mut self, nanos: u64) -> Result<Vec<Message>, IOError> {
         let duration = Duration::from_nanos(nanos);
 
@@ -303,24 +407,24 @@ impl<I: IO> ReplicaMessageBus<I> {
         Ok(messages)
     }
 
-    fn connect_to_other_replicas(&mut self) -> Result<(), IOError> {
-        let replicas = self.replicas.clone();
-        for (replica, connection_id) in replicas.into_iter() {
+    /// Connect to all the known replicas
+    fn connect_to_other_replicas(&mut self) {
+        for (replica, connection_id) in self.replicas.clone() {
             self.connect_to_replica(replica, connection_id);
         }
-
-        Ok(())
     }
 
+    /// Connect to a replica using an associated connection identifier. In case the connection
+    /// is successful, the connection identifier is returned.
     fn connect_to_replica(&mut self, replica: usize, connection_id: usize) -> Option<usize> {
-        let connection = self.connection_pool.get_mut(&connection_id)
+        let connection = self.connection_pool.get_mut(connection_id)
             .unwrap_or_else(|| panic!("Connection must be initialized (replica: {replica}, connection_id: {connection_id})"));
 
         if let ConnectionStatus::Connected = connection.status {
             return Some(connection_id);
         }
 
-        if !self.connect_retry.retry(&replica) {
+        if !self.connect_retry.should_retry(replica) {
             return None;
         }
 
@@ -330,62 +434,56 @@ impl<I: IO> ReplicaMessageBus<I> {
                 .as_ref()
                 .unwrap_or_else(|| panic!("Connection that is pending must have already a socket assigned (replica: {replica}, connection_id: {connection_id})"));
 
-            match socket.peer_addr() {
-                Ok(..) => {
-                    connection.status = ConnectionStatus::Connected;
-                    Some(connection_id)
-                }
-                Err(..) => {
-                    self.connect_retry.increase(replica, &mut self.rng);
-                    None
-                }
+            // In case the socket has an associated peer address, it means it's  already connected.
+            if socket.peer_addr().is_ok() {
+                connection.status = ConnectionStatus::Connected;
+                Some(connection_id)
+            } else {
+                self.connect_retry.increase(replica, &mut self.rng);
+                None
             }
         } else {
-            match self.io.connect(connection.address, connection_id) {
-                Ok(Some(socket)) => {
-                    connection.socket = Some(socket);
-                    connection.peer = Some(ConnectionPeer::Replica { id: replica });
-                    connection.status = ConnectionStatus::Pending;
+            // Try to connect to the connection's address in a non-blocking fashion.
+            if let Ok(Some(socket)) = self.io.connect(connection.address, connection_id) {
+                connection.socket = Some(socket);
+                connection.peer = Some(ConnectionPeer::Replica { id: replica });
+                connection.status = ConnectionStatus::Pending;
 
-                    self.connect_retry.reset(replica);
+                self.connect_retry.reset(replica);
 
-                    None
-                }
-                Ok(None) => {
-                    self.connect_retry.increase(replica, &mut self.rng);
-                    None
-                }
-                Err(..) => {
-                    self.connect_retry.increase(replica, &mut self.rng);
-                    None
-                }
+                None
+            } else {
+                self.connect_retry.increase(replica, &mut self.rng);
+                None
             }
         }
     }
 
+    /// Accept any incoming connections, either from other replicas or clients.
     fn accept(&mut self) -> Result<(), IOError> {
         let socket = self
             .socket
             .as_mut()
             .expect("Replica socket not available while accepting new connections");
 
-        let accepted_conns = self.io.accept(socket, self.connection_pool.next_id())?;
-
-        for accepted_conn in accepted_conns {
-            let mut connection = Connection::new(accepted_conn.socket.peer_addr()?);
+        for accepted in self.io.accept(socket, self.connection_pool.next_id())? {
+            let mut connection =
+                Connection::new(accepted.socket.peer_addr()?, self.encoding_config);
             connection.status = ConnectionStatus::Connected;
-            connection.socket = Some(accepted_conn.socket);
+            connection.socket = Some(accepted.socket);
             connection.peer = Some(ConnectionPeer::Unknown);
 
-            self.connection_pool.add(connection);
-            assert!(accepted_conn.connection_id == self.connection_pool.size());
+            let connection_id = self.connection_pool.add(connection);
+            assert!(connection_id == accepted.connection_id);
+            assert!(connection_id == self.connection_pool.size());
         }
 
         Ok(())
     }
 
+    /// Receive any possible new message waiting to be read from a given connection.
     fn recv(&mut self, connection_id: usize) -> Result<Option<Message>, IOError> {
-        let connection = self.connection_pool.get_mut(&connection_id).unwrap_or_else(|| {
+        let connection = self.connection_pool.get_mut(connection_id).unwrap_or_else(|| {
             panic!(
                 "No connection matches for a received operation (connection_id: {connection_id})"
             )
@@ -398,14 +496,22 @@ impl<I: IO> ReplicaMessageBus<I> {
 
         let close = self.io.recv(socket, &mut connection.incoming_buffer)?;
         if close {
-            self.close(connection_id)?;
+            self.close(connection_id);
             return Ok(None);
         }
 
-        let Some(message) = decode_message(&mut connection.incoming_buffer) else {
+        let Some(message) = Message::decode(&mut connection.incoming_buffer, self.encoding_config)?
+        else {
+            tracing::error!(
+                "Message could not be decoded (connection_id = {}, replica = {})",
+                connection_id,
+                self.replica
+            );
             return Ok(None);
         };
 
+        // Given the type of message received, set the connection peer,
+        // and refresh the associated known replica / client entry.
         match connection.set_message_peer(&message) {
             ConnectionPeer::Client { id } => {
                 self.clients.insert(*id, connection_id);
@@ -414,12 +520,14 @@ impl<I: IO> ReplicaMessageBus<I> {
                 self.replicas.insert(*id, connection_id);
             }
             ConnectionPeer::Unknown => {}
-        };
+        }
 
         Ok(Some(message))
     }
 
-    fn close(&mut self, connection_id: usize) -> Result<(), IOError> {
+    /// Close a connection. It will be removed from the connection pool
+    /// and from the entries of known replicas / clients.
+    fn close(&mut self, connection_id: usize) {
         let connection = self.connection_pool.remove(connection_id);
         match connection.peer {
             Some(ConnectionPeer::Replica { id }) => {
@@ -430,24 +538,24 @@ impl<I: IO> ReplicaMessageBus<I> {
             }
             Some(ConnectionPeer::Unknown) | None => {}
         }
-
-        Ok(())
     }
 
-    pub fn send_to_replica(&mut self, message: Message, replica: &usize) -> Result<(), IOError> {
+    /// Send a message to another replica in a non-blocking fashion. The message will be queued
+    /// to the connection's outgoing buffer to be ultimately sent.
+    pub fn send_to_replica(&mut self, message: &Message, replica: &usize) -> Result<bool, IOError> {
         let connection_id = self
             .replicas
             .get(replica)
-            .unwrap_or_else(|| panic!("Replica not found (from: {}, to: {replica})", self.current));
+            .unwrap_or_else(|| panic!("Replica not found (from: {}, to: {replica})", self.replica));
 
-        let connection = self.connection_pool.get_mut(connection_id)
+        let connection = self.connection_pool.get_mut(*connection_id)
             .unwrap_or_else(|| panic!("Connection for replica not found (replica: {replica}, connection_id: {connection_id})"));
 
         if connection.status != ConnectionStatus::Connected {
-            return Ok(());
+            return Ok(false);
         }
 
-        connection.queue_message(&message);
+        connection.queue_message(message)?;
 
         let socket = connection
             .socket
@@ -456,11 +564,13 @@ impl<I: IO> ReplicaMessageBus<I> {
 
         self.io.send(socket, *connection_id)?;
 
-        Ok(())
+        Ok(true)
     }
 
+    /// Write an outgoing message to the connection provided. A boolean is returned in case the
+    /// message was written or not.
     fn write(&mut self, connection_id: usize) -> Result<bool, IOError> {
-        let connection = self.connection_pool.get_mut(&connection_id).unwrap_or_else(|| {
+        let connection = self.connection_pool.get_mut(connection_id).unwrap_or_else(|| {
             panic!(
                 "No connection matches for a received operation (connection_id: {connection_id})"
             )
@@ -473,41 +583,43 @@ impl<I: IO> ReplicaMessageBus<I> {
         let socket = connection.socket.as_mut()
             .unwrap_or_else(|| panic!("Connection that is connected must have already a socket assigned (connection_id: {connection_id})"));
 
-        while let Some(buffer) = connection.outgoing_buffer.send_queue.front_mut() {
+        // Write the message from the outgoing buffer in chunks.
+        while let Some(mut buffer) = connection.outgoing_buffer.pop() {
             while !buffer.is_empty() {
-                let Some(written) = self.io.write(socket, buffer)? else {
+                let Some(written) = self.io.write(socket, &buffer)? else {
                     return Ok(true);
                 };
 
                 buffer.drain(..written);
             }
-
-            connection.outgoing_buffer.send_queue.pop_front();
         }
 
         Ok(false)
     }
 
+    /// Send a message to a client in a non-blocking fashion. The message will be queued
+    /// to the connection's outgoing buffer to be ultimately sent. A boolean is returned
+    /// in case the message was sent to the client or not.
     pub fn send_to_client(
         &mut self,
         message: ReplyMessage,
         client_id: &usize,
-    ) -> Result<(), IOError> {
+    ) -> Result<bool, IOError> {
         let connection_id = self
             .clients
             .get(client_id)
             .unwrap_or_else(|| panic!("Client not found (client: {client_id})"));
 
-        let connection = self.connection_pool.get_mut(connection_id)
+        let connection = self.connection_pool.get_mut(*connection_id)
             .unwrap_or_else(|| panic!("Connection for client not found (client: {client_id}, connection_id: {connection_id})"));
 
+        // If the connection is not ready yet
         if connection.status != ConnectionStatus::Connected {
-            // TODO: If the client is not connected to the replica, then?
-            return Ok(());
+            return Ok(false);
         }
 
         let message = Message::Reply(message);
-        connection.queue_message(&message);
+        connection.queue_message(&message)?;
 
         let socket = connection
             .socket
@@ -516,68 +628,97 @@ impl<I: IO> ReplicaMessageBus<I> {
 
         self.io.send(socket, *connection_id)?;
 
-        Ok(())
+        Ok(true)
     }
 
+    /// Trigger a tick iteration for the bus. In case messages were received from
+    /// the incoming buffer, they are returned so the local replica can process them.
     pub fn tick(&mut self) -> Result<Vec<Message>, IOError> {
-        self.connect_to_other_replicas()?;
-        let messages = self.run_for_ns(200)?;
+        self.connect_to_other_replicas();
+        let messages = self.run_for_ns(TICK_TIMEOUT_NS)?;
         self.connect_retry.tick();
 
         Ok(messages)
     }
 }
 
-pub struct ClientMessageBus<I> {
+/// The message bus used by the client. The bus is in charge of accepting and
+/// closing connections to the client, as well as sending and receiving
+/// messages from replicas.
+pub struct ClientMessageBus<IO> {
+    /// The client's identifier
+    client_id: usize,
+
+    /// The address of the current replica.
     address: SocketAddr,
-    socket: Option<TcpListener>, // TODO: Define this as a connection?
+
+    /// The socket used to listen for messages.
+    socket: Option<TcpListener>,
+
+    /// The connection pool of the replica bus.
     connection_pool: ConnectionPool,
+
+    /// A key-value map identifying each connected replica to the associated
+    /// connection identifier.
     replicas: HashMap<usize, usize>,
-    connect_retry: RetryInfo,
+
+    /// A retry timeout used for connecting to the replicas.
+    connect_retry: RetryTimeout,
+
+    /// A random generator used by the connect retry timeout.
     rng: ChaCha8Rng,
-    io: I,
+
+    /// The IO object used to read / write messages from the connections.
+    io: IO,
+
+    /// The `bincode` configuration used to encode / decode messages.
+    encoding_config: Configuration,
 }
 
 impl<I: IO> ClientMessageBus<I> {
+    /// Create a new instance of a message bus for a client.
     pub fn new(config: &ClientConfig, io: I) -> Self {
+        let encoding_config = bincode::config::standard();
         let mut connections = ConnectionPool::new();
         let mut replicas = HashMap::with_capacity(config.replicas.len() - 1);
-        let mut connect_attempts = HashMap::with_capacity(config.replicas.len() - 1);
+        let mut connect_attempts = Vec::with_capacity(config.replicas.len());
 
+        // Connect to all the known replicas.
         for (replica, address) in config.replicas.iter().enumerate() {
-            let connection_id = connections.add(Connection::new(*address));
+            let connection_id = connections.add(Connection::new(*address, encoding_config));
             replicas.insert(replica, connection_id);
-            connect_attempts.insert(replica, 0);
+            connect_attempts.push(replica);
         }
 
         ClientMessageBus {
+            client_id: config.client_id,
             address: config.address,
             socket: None,
             connection_pool: connections,
             replicas,
-            connect_retry: RetryInfo::start(
+            connect_retry: RetryTimeout::new(
                 CONNECT_RETRY_TIMEOUT_ID,
                 CONNECT_DELAY_MIN,
                 connect_attempts,
             ),
             rng: ChaCha8Rng::seed_from_u64(config.seed),
             io,
+            encoding_config,
         }
     }
 
+    /// Initialize the bus and open a TCP address to allow incoming
+    /// connections.
     pub fn init(&mut self) -> Result<(), IOError> {
         self.socket = Some(self.io.open_tcp(self.address)?);
+        self.connect_retry.init();
         Ok(())
     }
 
+    /// Check if all the known replicas have an associated connection ready to send messages to.
     pub(crate) fn is_connected(&self) -> bool {
-        let has_all_connections = self.connection_pool.size() == self.replicas.len();
-        if !has_all_connections {
-            return false;
-        }
-
-        for (_, connection_id) in self.replicas.iter() {
-            let Some(connection) = self.connection_pool.get(connection_id) else {
+        for connection_id in self.replicas.values() {
+            let Some(connection) = self.connection_pool.get(*connection_id) else {
                 return false;
             };
 
@@ -589,6 +730,9 @@ impl<I: IO> ClientMessageBus<I> {
         true
     }
 
+    /// Run any pending IO operations with a given timeout in nanoseconds.
+    /// All the operations will be executed and in case any incoming message
+    /// has been received, it will be returned.
     fn run_for_ns(&mut self, nanos: u64) -> Result<Vec<Message>, IOError> {
         let duration = Duration::from_nanos(nanos);
 
@@ -610,24 +754,24 @@ impl<I: IO> ClientMessageBus<I> {
         Ok(messages)
     }
 
-    fn connect_to_replicas(&mut self) -> Result<(), IOError> {
-        let replicas = self.replicas.clone();
-        for (replica, connection_id) in replicas.into_iter() {
+    /// Connect to all the known replicas
+    fn connect_to_replicas(&mut self) {
+        for (replica, connection_id) in self.replicas.clone() {
             self.connect_to_replica(replica, connection_id);
         }
-
-        Ok(())
     }
 
+    /// Connect to a replica using an associated connection identifier. In case the connection
+    /// is successful, the connection identifier is returned.
     fn connect_to_replica(&mut self, replica: usize, connection_id: usize) -> Option<usize> {
-        let connection = self.connection_pool.get_mut(&connection_id)
+        let connection = self.connection_pool.get_mut(connection_id)
             .unwrap_or_else(|| panic!("Connection must be initialized (replica: {replica}, connection_id: {connection_id})"));
 
         if let ConnectionStatus::Connected = connection.status {
             return Some(connection_id);
         }
 
-        if !self.connect_retry.retry(&replica) {
+        if !self.connect_retry.should_retry(replica) {
             return None;
         }
 
@@ -637,63 +781,53 @@ impl<I: IO> ClientMessageBus<I> {
                 .as_ref()
                 .unwrap_or_else(|| panic!("Connection that is pending must have already a socket assigned (replica: {replica}, connection_id: {connection_id})"));
 
-            match socket.peer_addr() {
-                Ok(..) => {
-                    connection.status = ConnectionStatus::Connected;
-                    Some(connection_id)
-                }
-                Err(..) => {
-                    self.connect_retry.increase(replica, &mut self.rng);
-                    None
-                }
+            // In case the socket has an associated peer address, it means it's  already connected.
+            if socket.peer_addr().is_ok() {
+                connection.status = ConnectionStatus::Connected;
+                Some(connection_id)
+            } else {
+                self.connect_retry.increase(replica, &mut self.rng);
+                None
             }
+        } else if let Ok(Some(socket)) = self.io.connect(connection.address, connection_id) {
+            connection.socket = Some(socket);
+            connection.peer = Some(ConnectionPeer::Replica { id: replica });
+            connection.status = ConnectionStatus::Pending;
+
+            self.connect_retry.reset(replica);
+
+            None
         } else {
-            match self.io.connect(connection.address, connection_id) {
-                Ok(Some(socket)) => {
-                    connection.socket = Some(socket);
-                    connection.peer = Some(ConnectionPeer::Replica { id: replica });
-                    connection.status = ConnectionStatus::Pending;
-
-                    self.connect_retry.reset(replica);
-
-                    None
-                }
-                Ok(None) => {
-                    self.connect_retry.increase(replica, &mut self.rng);
-                    None
-                }
-                Err(..) => {
-                    self.connect_retry.increase(replica, &mut self.rng);
-                    None
-                }
-            }
+            self.connect_retry.increase(replica, &mut self.rng);
+            None
         }
     }
 
+    /// Accept any incoming connections from any replica.
     fn accept(&mut self) -> Result<(), IOError> {
         let socket = self
             .socket
             .as_mut()
-            .expect("Client socket not available while accepting new connections");
+            .expect("Replica socket not available while accepting new connections");
 
-        let connection_id = self.connection_pool.next_id();
-        let accepted_conns = self.io.accept(socket, connection_id)?;
-
-        for accepted_conn in accepted_conns {
-            let mut connection = Connection::new(accepted_conn.socket.peer_addr()?);
+        for accepted in self.io.accept(socket, self.connection_pool.next_id())? {
+            let mut connection =
+                Connection::new(accepted.socket.peer_addr()?, self.encoding_config);
             connection.status = ConnectionStatus::Connected;
-            connection.socket = Some(accepted_conn.socket);
+            connection.socket = Some(accepted.socket);
             connection.peer = Some(ConnectionPeer::Unknown);
 
-            self.connection_pool.add(connection);
-            assert!(accepted_conn.connection_id == self.connection_pool.size());
+            let connection_id = self.connection_pool.add(connection);
+            assert!(connection_id == accepted.connection_id);
+            assert!(connection_id == self.connection_pool.size());
         }
 
         Ok(())
     }
 
+    /// Receive any possible new message waiting to be read from a given connection.
     fn recv(&mut self, connection_id: usize) -> Result<Option<Message>, IOError> {
-        let connection = self.connection_pool.get_mut(&connection_id).unwrap_or_else(|| {
+        let connection = self.connection_pool.get_mut(connection_id).unwrap_or_else(|| {
             panic!(
                 "No connection matches for a received operation (connection_id: {connection_id})"
             )
@@ -706,46 +840,56 @@ impl<I: IO> ClientMessageBus<I> {
 
         let close = self.io.recv(socket, &mut connection.incoming_buffer)?;
         if close {
-            self.close(connection_id)?;
+            self.close(connection_id);
             return Ok(None);
         }
 
-        let Some(message) = decode_message(&mut connection.incoming_buffer) else {
+        let Some(message) = Message::decode(&mut connection.incoming_buffer, self.encoding_config)?
+        else {
+            tracing::error!(
+                "Message could not be decoded (connection_id = {}, client = {})",
+                connection_id,
+                self.client_id
+            );
             return Ok(None);
         };
 
+        // Given the type of message received, set the connection peer,
+        // and refresh the associated known replica entry.
         match connection.set_message_peer(&message) {
             ConnectionPeer::Replica { id } => {
                 self.replicas.insert(*id, connection_id);
             }
             ConnectionPeer::Client { .. } => unreachable!(),
             ConnectionPeer::Unknown => {}
-        };
+        }
 
         Ok(Some(message))
     }
 
-    fn close(&mut self, connection_id: usize) -> Result<(), IOError> {
+    /// Close a connection. It will be removed from the connection pool
+    /// and from the entries of known replicas.
+    fn close(&mut self, connection_id: usize) {
         let connection = self.connection_pool.remove(connection_id);
         if let Some(ConnectionPeer::Replica { id }) = connection.peer {
             self.replicas.remove(&id);
         }
-
-        Ok(())
     }
 
-    pub fn send_to_replica(&mut self, message: Message, replica: &usize) -> Result<(), IOError> {
+    /// Send a message to a replica in a non-blocking fashion. The message will be queued
+    /// to the connection's outgoing buffer to be ultimately sent.
+    pub fn send_to_replica(&mut self, message: &Message, replica: &usize) -> Result<(), IOError> {
         let connection_id = self
             .replicas
             .get(replica)
             .unwrap_or_else(|| panic!("Replica not found (replica: {replica})"));
 
-        let connection = self.connection_pool.get_mut(connection_id)
+        let connection = self.connection_pool.get_mut(*connection_id)
             .unwrap_or_else(|| panic!("Connection for replica not found (replica: {replica}, connection_id: {connection_id})"));
 
         assert!(connection.status == ConnectionStatus::Connected);
 
-        connection.queue_message(&message);
+        connection.queue_message(message)?;
 
         let socket = connection
             .socket
@@ -757,8 +901,10 @@ impl<I: IO> ClientMessageBus<I> {
         Ok(())
     }
 
+    /// Write an outgoing message to the connection provided. A boolean is returned in case the
+    /// message was written or not.
     fn write(&mut self, connection_id: usize) -> Result<bool, IOError> {
-        let connection = self.connection_pool.get_mut(&connection_id).unwrap_or_else(|| {
+        let connection = self.connection_pool.get_mut(connection_id).unwrap_or_else(|| {
             panic!(
                 "No connection matches for a received operation (connection_id: {connection_id})"
             )
@@ -771,24 +917,25 @@ impl<I: IO> ClientMessageBus<I> {
         let socket = connection.socket.as_mut()
             .unwrap_or_else(|| panic!("Connection that is connected must have already a socket assigned (connection_id: {connection_id})"));
 
-        while let Some(buffer) = connection.outgoing_buffer.send_queue.front_mut() {
+        // Write the message from the outgoing buffer in chunks.
+        while let Some(mut buffer) = connection.outgoing_buffer.pop() {
             while !buffer.is_empty() {
-                let Some(written) = self.io.write(socket, buffer)? else {
+                let Some(written) = self.io.write(socket, &buffer)? else {
                     return Ok(true);
                 };
 
                 buffer.drain(..written);
             }
-
-            connection.outgoing_buffer.send_queue.pop_front();
         }
 
         Ok(false)
     }
 
+    /// Trigger a tick iteration for the bus. In case messages were received from
+    /// the incoming buffer, they are returned so the client can process them.
     pub fn tick(&mut self) -> Result<Vec<Message>, IOError> {
-        self.connect_to_replicas()?;
-        let messages = self.run_for_ns(200)?;
+        self.connect_to_replicas();
+        let messages = self.run_for_ns(TICK_TIMEOUT_NS)?;
         self.connect_retry.tick();
 
         Ok(messages)

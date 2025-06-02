@@ -91,6 +91,7 @@ fn main() {
     sleep(Duration::from_secs(1));
 
     let mut client = Client::new(&client_options, primary).unwrap();
+    client.init().unwrap();
 
     while !client.is_ready() {
         let responses = client.tick::<i32>().unwrap();

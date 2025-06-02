@@ -87,7 +87,7 @@ impl ReplicaOptions {
     pub fn parse(&self) -> Result<ReplicaConfig, InputError> {
         let mut socket_addresses = Vec::with_capacity(self.addresses.len());
         for address in &self.addresses {
-            socket_addresses.push(address.parse()?)
+            socket_addresses.push(address.parse()?);
         }
 
         Ok(ReplicaConfig {
@@ -110,7 +110,7 @@ impl ClientOptions {
     fn parse(&self) -> Result<ClientConfig, InputError> {
         let mut socket_addresses = Vec::with_capacity(self.replicas.len());
         for address in &self.replicas {
-            socket_addresses.push(address.parse()?)
+            socket_addresses.push(address.parse()?);
         }
 
         Ok(ClientConfig {
@@ -135,7 +135,7 @@ impl Cluster {
         let io = PollIO::new()?;
         let bus = ReplicaMessageBus::new(&config, io);
 
-        Ok(Replica::new(config.replica, total, service.clone(), bus))
+        Ok(Replica::new(config.replica, total, service, bus))
     }
 
     pub fn primary<S, IO>(replicas: &Vec<Replica<S, IO>>) -> usize {

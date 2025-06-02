@@ -56,7 +56,7 @@ fn main() -> Result<(), IOError> {
                     operation,
                 });
                 println!("message sent from replica 0: {:?}", greeting);
-                bus.send_to_replica(message, &1).unwrap();
+                bus.send_to_replica(&message, &1).unwrap();
                 count = 0;
                 request += 1;
             }
@@ -90,7 +90,7 @@ fn main() -> Result<(), IOError> {
                 operation,
             });
             println!("message sent from replica 1: {:?}", greeting);
-            bus.send_to_replica(message, &0).unwrap();
+            bus.send_to_replica(&message, &0).unwrap();
             count = 0;
             request += 1;
         }

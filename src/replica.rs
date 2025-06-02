@@ -70,7 +70,7 @@ pub struct Replica<S, IO> {
     /// An unsorted set of recovery acknowledgements coming from other replicas.
     recovery_acks: Vec<RecoveryAck>,
 
-    /// Log entries of size "operation_number" containing the requests
+    /// Log entries of size `operation_number` containing the requests
     /// that have been received so far in their assigned order.
     log: Log,
 
@@ -144,13 +144,11 @@ where
             health.tick();
 
             for message in messages {
-                let result = self
+                if let Err(err) = self
                     .handle_message(message)
-                    .and_then(|output| self.handle_output(output));
-
-                match result {
-                    Ok(_) => continue,
-                    Err(err) => self.handle_err(err),
+                    .and_then(|output| self.handle_output(output))
+                {
+                    self.handle_err(&err);
                 }
             }
         }
@@ -162,12 +160,26 @@ where
             HandleOutput::Actions(actions) => {
                 for action in actions {
                     match action {
-                        OutputAction::Broadcast { message } => self.broadcast(message)?,
+                        OutputAction::Broadcast { message } => self.broadcast(&message)?,
                         OutputAction::Send { message, replica } => {
-                            self.bus.send_to_replica(message, &replica)?
+                            let sent = self.bus.send_to_replica(&message, &replica)?;
+                            if !sent {
+                                tracing::error!(
+                                    "Message could not be sent replica (from: {}, to: {})",
+                                    self.replica_number,
+                                    replica
+                                );
+                            }
                         }
                         OutputAction::SendClient { message, client_id } => {
-                            self.bus.send_to_client(message, &client_id)?
+                            let sent = self.bus.send_to_client(message, &client_id)?;
+                            if !sent {
+                                tracing::error!(
+                                    "Message could not be sent client (replica: {}, client: {})",
+                                    self.replica_number,
+                                    client_id
+                                );
+                            }
                         }
                     }
                 }
@@ -177,18 +189,18 @@ where
         }
     }
 
-    fn broadcast(&mut self, message: Message) -> Result<(), ReplicaError> {
+    fn broadcast(&mut self, message: &Message) -> Result<(), ReplicaError> {
         // For all the replicas except itself
         for i in 0..self.total {
             if i != self.replica_number {
-                self.bus.send_to_replica(message.clone(), &i)?;
+                self.bus.send_to_replica(message, &i)?;
             }
         }
 
         Ok(())
     }
 
-    fn handle_err(&mut self, err: ReplicaError) {
+    fn handle_err(&mut self, err: &ReplicaError) {
         match err {
             ReplicaError::Network
             | ReplicaError::NotReady
@@ -200,9 +212,9 @@ where
                 );
             }
             ReplicaError::InvalidState | ReplicaError::ServiceExecution => {
-                self.trigger_recovery()
-                    .and_then(|output| self.handle_output(output))
-                    .unwrap_or_else(|err| self.handle_err(err));
+                let output = self.trigger_recovery();
+                self.handle_output(output)
+                    .unwrap_or_else(|err| self.handle_err(&err));
             }
         }
     }
@@ -403,7 +415,7 @@ where
         // Quorum not reached yet. Primary waits for more `PrepareOk` messages
         if ack_replicas.len() < quorum(self.total) {
             return Ok(HandleOutput::DoNothing);
-        };
+        }
 
         // Execute the query
         let operation = self
@@ -765,7 +777,7 @@ where
 
         if self.recovery_acks.len() < (quorum(self.total) + 1) {
             return Ok(HandleOutput::DoNothing);
-        };
+        }
 
         // Read the primary acknowledgements of the latest view. If no acknowledgement from the
         // primary replicas has been received, the recovering replica must wait.
@@ -887,7 +899,7 @@ where
         Ok(HandleOutput::broadcast(message))
     }
 
-    fn trigger_recovery(&mut self) -> Result<HandleOutput, ReplicaError> {
+    fn trigger_recovery(&mut self) -> HandleOutput {
         let nonce = nonce();
         self.status = ReplicaStatus::Recovering { nonce };
 
@@ -896,7 +908,7 @@ where
             nonce,
         });
 
-        Ok(HandleOutput::broadcast(message))
+        HandleOutput::broadcast(message)
     }
 
     fn is_primary(&self) -> bool {
@@ -1008,7 +1020,7 @@ impl Log {
 
     fn merge(&mut self, log: Log) {
         for entry in log.entries {
-            self.entries.push(entry)
+            self.entries.push(entry);
         }
     }
 
@@ -2044,7 +2056,7 @@ mod tests {
         let result = replica.trigger_recovery();
 
         // then
-        let HandleOutput::Actions(actions) = result.unwrap() else {
+        let HandleOutput::Actions(actions) = result else {
             panic!("Unexpected handle output")
         };
         assert_eq!(actions.len(), 1);

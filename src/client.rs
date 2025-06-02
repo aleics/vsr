@@ -46,6 +46,11 @@ impl Client<PollIO> {
         })
     }
 
+    pub fn init(&mut self) -> Result<(), ClientError> {
+        self.bus.init()?;
+        Ok(())
+    }
+
     pub fn is_ready(&self) -> bool {
         self.bus.is_connected()
     }
@@ -65,7 +70,7 @@ impl Client<PollIO> {
         };
 
         self.bus
-            .send_to_replica(Message::Request(message), &self.view)?;
+            .send_to_replica(&Message::Request(message), &self.view)?;
 
         *request_number += 1;
 

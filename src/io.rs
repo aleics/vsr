@@ -10,6 +10,8 @@ use crate::MESSAGE_SIZE_MAX;
 const SERVER: Token = Token(0);
 const EVENTS_CAPACITY: usize = 128;
 
+/// A completion represents an IO operation that has finished.
+/// Returned by the IO system, it indicates that the operation is ready.
 #[derive(Debug)]
 pub enum Completion {
     Accept,
@@ -23,35 +25,46 @@ pub struct AcceptedConnection {
 }
 
 pub trait IO {
+    /// Open a TCP connection to a given address.
     fn open_tcp(&self, addr: SocketAddr) -> Result<TcpListener, IOError>;
 
+    /// Connect to a given address using a connection identifier.
     fn connect(
         &mut self,
         addr: SocketAddr,
         connection_id: usize,
     ) -> Result<Option<TcpStream>, IOError>;
 
+    /// Accept an incoming connection to the provided listener.
     fn accept(
         &mut self,
         socket: &TcpListener,
         connection_id: usize,
     ) -> Result<Vec<AcceptedConnection>, IOError>;
 
+    /// Receive a new message in the socket. The result is stored in the buffer provided as a mutable reference.
+    /// A boolean is returned if the connection mus be closed or not.
     fn recv(&self, socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<bool, IOError>;
 
+    /// Send a new message to the provided socket. This is used as a first step. Once the non-blocking connection
+    /// is available to write the message, the `IO::write` should be used.
     fn send(&self, socket: &mut TcpStream, connection_id: usize) -> Result<(), IOError>;
 
-    fn write(&self, socket: &mut TcpStream, buffer: &[u8]) -> Result<Option<usize>, IOError>;
+    /// Write a certain amount of bytes to a socket.
+    fn write(&self, socket: &mut TcpStream, bytes: &[u8]) -> Result<Option<usize>, IOError>;
 
-    fn run(&mut self, duration: Duration) -> Result<Vec<Completion>, IOError>;
+    /// Run any IO operations with a certain timeout.
+    fn run(&mut self, timeout: Duration) -> Result<Vec<Completion>, IOError>;
 }
 
+/// `PollIO` is an implementation of the IO trait using [`mio`](https://github.com/tokio-rs/mio).
 pub struct PollIO {
     poll: Poll,
     events: Events,
 }
 
 impl PollIO {
+    /// Create a new `PollIO` instance
     pub fn new() -> Result<Self, IOError> {
         Ok(Self {
             poll: Poll::new()?,
@@ -132,6 +145,9 @@ impl IO for PollIO {
         let mut buf = [0; MESSAGE_SIZE_MAX];
 
         loop {
+            // The complete content of the socket is read. A `WouldBlock` error notifies that
+            // there's no more content in the socket waiting to be read, and thus, it will block
+            // (wait) for new incoming messages.
             let n = match socket.read(&mut buf) {
                 Ok(0) => return Ok(true),
                 Ok(n) => Ok(n),
@@ -157,8 +173,8 @@ impl IO for PollIO {
         Ok(())
     }
 
-    fn write(&self, socket: &mut TcpStream, buf: &[u8]) -> Result<Option<usize>, IOError> {
-        let written = match socket.write(buf) {
+    fn write(&self, socket: &mut TcpStream, bytes: &[u8]) -> Result<Option<usize>, IOError> {
+        let written = match socket.write(bytes) {
             Ok(0) => Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -168,13 +184,13 @@ impl IO for PollIO {
         Ok(Some(written))
     }
 
-    fn run(&mut self, duration: Duration) -> Result<Vec<Completion>, IOError> {
+    fn run(&mut self, timeout: Duration) -> Result<Vec<Completion>, IOError> {
         self.events.clear();
-        self.poll.poll(&mut self.events, Some(duration))?;
+        self.poll.poll(&mut self.events, Some(timeout))?;
 
         let mut completions = Vec::with_capacity(EVENTS_CAPACITY);
 
-        for event in self.events.iter() {
+        for event in &self.events {
             match event.token() {
                 SERVER => {
                     completions.push(Completion::Accept);
@@ -184,7 +200,7 @@ impl IO for PollIO {
                     if event.is_readable() {
                         completions.push(Completion::Recv {
                             connection: token.0,
-                        })
+                        });
                     }
 
                     // The event notifies that the socket can be written on, thus, schedule a write of any pending
@@ -192,10 +208,10 @@ impl IO for PollIO {
                     if event.is_writable() {
                         completions.push(Completion::Write {
                             connection: token.0,
-                        })
+                        });
                     }
                 }
-            };
+            }
         }
 
         Ok(completions)
