@@ -5,6 +5,7 @@ use std::{
 };
 
 use clap::{Parser, command};
+use rand::Rng;
 use vsr::{ClientOptions, client::Client, io::PollIO};
 
 #[derive(Parser, Debug)]
@@ -20,6 +21,11 @@ struct Args {
     seed: u64,
 }
 
+fn random(max: u64) -> u64 {
+    let mut rng = rand::rng();
+    rng.random_range(0..max)
+}
+
 fn start_client(options: &ClientOptions) -> Client<PollIO> {
     let mut client = vsr::client(options, 0).unwrap();
     client.init().unwrap();
@@ -29,16 +35,16 @@ fn start_client(options: &ClientOptions) -> Client<PollIO> {
 
 fn main() {
     let args = Args::parse();
+    let client_id = random(args.seed);
     let options = ClientOptions {
         seed: args.seed,
         address: args.address,
-        client_id: 0,
+        client_id: client_id as usize,
         replicas: args.replicas,
     };
 
     let mut client = start_client(&options);
-
-    println!("Starting client...");
+    println!("Starting client (id: {})...", client_id);
 
     while !client.is_ready() {
         client.tick::<i32>().unwrap();
