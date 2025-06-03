@@ -496,7 +496,7 @@ impl<I: IO> ReplicaMessageBus<I> {
 
         let close = self.io.recv(socket, &mut connection.incoming_buffer)?;
         if close {
-            self.close(connection_id);
+            self.close(connection_id)?;
             return Ok(None);
         }
 
@@ -527,8 +527,17 @@ impl<I: IO> ReplicaMessageBus<I> {
 
     /// Close a connection. It will be removed from the connection pool
     /// and from the entries of known replicas / clients.
-    fn close(&mut self, connection_id: usize) {
+    fn close(&mut self, connection_id: usize) -> Result<(), IOError> {
         let connection = self.connection_pool.remove(connection_id);
+        let mut socket = connection.socket.unwrap_or_else(|| {
+            panic!(
+                "Connection being closed must be have a socket (connection_id: {}, replica: {})",
+                connection_id, self.replica
+            )
+        });
+
+        self.io.close(&mut socket)?;
+
         match connection.peer {
             Some(ConnectionPeer::Replica { id }) => {
                 self.replicas.remove(&id);
@@ -537,7 +546,9 @@ impl<I: IO> ReplicaMessageBus<I> {
                 self.clients.remove(&id);
             }
             Some(ConnectionPeer::Unknown) | None => {}
-        }
+        };
+
+        Ok(())
     }
 
     /// Send a message to another replica in a non-blocking fashion. The message will be queued
@@ -606,7 +617,7 @@ impl<I: IO> ReplicaMessageBus<I> {
     /// in case the message was sent to the client or not.
     pub(crate) fn send_to_client(
         &mut self,
-        message: ReplyMessage,
+        reply: ReplyMessage,
         client_id: &usize,
     ) -> Result<bool, IOError> {
         let connection_id = self
@@ -622,7 +633,7 @@ impl<I: IO> ReplicaMessageBus<I> {
             return Ok(false);
         }
 
-        let message = Message::Reply(message);
+        let message = Message::Reply(reply);
         connection.queue_message(&message)?;
 
         let socket = connection
@@ -844,7 +855,7 @@ impl<I: IO> ClientMessageBus<I> {
 
         let close = self.io.recv(socket, &mut connection.incoming_buffer)?;
         if close {
-            self.close(connection_id);
+            self.close(connection_id)?;
             return Ok(None);
         }
 
@@ -873,11 +884,22 @@ impl<I: IO> ClientMessageBus<I> {
 
     /// Close a connection. It will be removed from the connection pool
     /// and from the entries of known replicas.
-    fn close(&mut self, connection_id: usize) {
+    fn close(&mut self, connection_id: usize) -> Result<(), IOError> {
         let connection = self.connection_pool.remove(connection_id);
+        let mut socket = connection.socket.unwrap_or_else(|| {
+            panic!(
+                "Connection being closed must be have a socket (connection_id: {}, client: {})",
+                connection_id, self.client_id
+            )
+        });
+
+        self.io.close(&mut socket)?;
+
         if let Some(ConnectionPeer::Replica { id }) = connection.peer {
             self.replicas.remove(&id);
         }
+
+        Ok(())
     }
 
     /// Send a message to a replica in a non-blocking fashion. The message will be queued

@@ -42,6 +42,8 @@ pub trait IO {
         connection_id: usize,
     ) -> Result<Vec<AcceptedConnection>, IOError>;
 
+    fn close(&self, socket: &mut TcpStream) -> Result<(), IOError>;
+
     /// Receive a new message in the socket. The result is stored in the buffer provided as a mutable reference.
     /// A boolean is returned if the connection mus be closed or not.
     fn recv(&self, socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<bool, IOError>;
@@ -139,6 +141,12 @@ impl IO for PollIO {
         }
 
         Ok(accepted)
+    }
+
+    fn close(&self, socket: &mut TcpStream) -> Result<(), IOError> {
+        self.poll.registry().deregister(socket)?;
+
+        Ok(())
     }
 
     fn recv(&self, socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<bool, IOError> {

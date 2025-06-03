@@ -168,8 +168,8 @@ where
                                 );
                             }
                         }
-                        OutputAction::SendClient { message, client_id } => {
-                            let sent = self.bus.send_to_client(message, &client_id)?;
+                        OutputAction::SendClient { reply, client_id } => {
+                            let sent = self.bus.send_to_client(reply, &client_id)?;
                             if !sent {
                                 tracing::error!(
                                     "Message could not be sent client (replica: {}, client: {})",
@@ -636,7 +636,7 @@ where
                 };
 
                 actions.push(OutputAction::SendClient {
-                    message: ReplyMessage {
+                    reply: ReplyMessage {
                         view: self.view,
                         request_number: log_entry.request_number,
                         result,
@@ -932,8 +932,8 @@ impl HandleOutput {
         HandleOutput::Actions(vec![OutputAction::Send { message, replica }])
     }
 
-    fn send_client(message: ReplyMessage, client_id: usize) -> Self {
-        HandleOutput::Actions(vec![OutputAction::SendClient { message, client_id }])
+    fn send_client(reply: ReplyMessage, client_id: usize) -> Self {
+        HandleOutput::Actions(vec![OutputAction::SendClient { reply, client_id }])
     }
 }
 
@@ -947,7 +947,7 @@ enum OutputAction {
         replica: usize,
     },
     SendClient {
-        message: ReplyMessage,
+        reply: ReplyMessage,
         client_id: usize,
     },
 }
@@ -1180,6 +1180,10 @@ mod tests {
             _: &TcpListener,
             _: usize,
         ) -> Result<Vec<AcceptedConnection>, crate::io::IOError> {
+            unreachable!()
+        }
+
+        fn close(&self, _: &mut TcpStream) -> Result<(), crate::io::IOError> {
             unreachable!()
         }
 
@@ -1904,7 +1908,7 @@ mod tests {
             result,
             HandleOutput::Actions(vec![
                 OutputAction::SendClient {
-                    message: ReplyMessage {
+                    reply: ReplyMessage {
                         view: 1,
                         request_number: 2,
                         result: usize_as_bytes(2),
