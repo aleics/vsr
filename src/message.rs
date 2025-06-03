@@ -7,7 +7,7 @@ use bincode::{
 use crate::{OPERATION_SIZE_MAX, replica::Log};
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub enum Message {
+pub(crate) enum Message {
     Request(RequestMessage),
     Prepare(PrepareMessage),
     PrepareOk(PrepareOkMessage),
@@ -58,15 +58,15 @@ impl Message {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct RequestMessage {
-    pub view: usize,
-    pub request_number: usize,
-    pub client_id: usize,
-    pub operation: Operation,
+pub(crate) struct RequestMessage {
+    pub(crate) view: usize,
+    pub(crate) request_number: usize,
+    pub(crate) client_id: usize,
+    pub(crate) operation: Operation,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct PrepareMessage {
+pub(crate) struct PrepareMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
@@ -74,7 +74,7 @@ pub struct PrepareMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct PrepareOkMessage {
+pub(crate) struct PrepareOkMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
     pub(crate) replica_number: usize,
@@ -82,21 +82,21 @@ pub struct PrepareOkMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct CommitMessage {
+pub(crate) struct CommitMessage {
     pub(crate) replica_number: usize,
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct GetStateMessage {
+pub(crate) struct GetStateMessage {
     pub(crate) view: usize,
     pub(crate) operation_number: usize,
     pub(crate) replica_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct NewStateMessage {
+pub(crate) struct NewStateMessage {
     pub(crate) view: usize,
     pub(crate) replica_number: usize,
     pub(crate) log_after_operation: Log,
@@ -105,13 +105,13 @@ pub struct NewStateMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct StartViewChangeMessage {
+pub(crate) struct StartViewChangeMessage {
     pub(crate) new_view: usize,
     pub(crate) replica_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct DoViewChangeMessage {
+pub(crate) struct DoViewChangeMessage {
     pub(crate) old_view: usize,
     pub(crate) new_view: usize,
     pub(crate) log: Log,
@@ -121,7 +121,7 @@ pub struct DoViewChangeMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct StartViewMessage {
+pub(crate) struct StartViewMessage {
     pub(crate) replica_number: usize,
     pub(crate) view: usize,
     pub(crate) log: Log,
@@ -130,13 +130,13 @@ pub struct StartViewMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct RecoveryMessage {
+pub(crate) struct RecoveryMessage {
     pub(crate) replica_number: usize,
     pub(crate) nonce: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct RecoveryResponseMessage {
+pub(crate) struct RecoveryResponseMessage {
     pub(crate) replica_number: usize,
     pub(crate) view: usize,
     pub(crate) nonce: u64,
@@ -144,17 +144,17 @@ pub struct RecoveryResponseMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct RecoveryPrimaryResponse {
+pub(crate) struct RecoveryPrimaryResponse {
     pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct ReplyMessage {
+pub(crate) struct ReplyMessage {
     pub(crate) view: usize,
     pub(crate) request_number: usize,
     pub(crate) result: Operation,
 }
 
-pub type Operation = [u8; OPERATION_SIZE_MAX];
+pub(crate) type Operation = [u8; OPERATION_SIZE_MAX];

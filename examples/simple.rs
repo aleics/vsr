@@ -3,8 +3,7 @@ use std::thread::{self, sleep};
 use std::time::Duration;
 
 use bincode::{Decode, Encode};
-use vsr::client::Client;
-use vsr::{ClientOptions, Cluster, ReplicaOptions, Service, ServiceError};
+use vsr::{ClientOptions, ReplicaOptions, Service, ServiceError};
 
 #[derive(Debug)]
 struct Counter {
@@ -66,7 +65,7 @@ fn main() {
             addresses: replica_addresses.clone(),
         };
 
-        let mut replica = Cluster::create_replica(
+        let mut replica = vsr::replica(
             &replica_options,
             Counter {
                 value: Mutex::new(1),
@@ -80,8 +79,6 @@ fn main() {
         println!("Replica {} created", i);
     }
 
-    let primary = Cluster::primary(&replicas);
-
     for replica in replicas.into_iter() {
         handles.push(thread::spawn(move || {
             replica.run().unwrap();
@@ -90,7 +87,7 @@ fn main() {
 
     sleep(Duration::from_secs(1));
 
-    let mut client = Client::new(&client_options, primary).unwrap();
+    let mut client = vsr::client(&client_options, 0).unwrap();
     client.init().unwrap();
 
     while !client.is_ready() {

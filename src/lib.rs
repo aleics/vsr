@@ -1,11 +1,10 @@
-use std::{collections::HashMap, net::AddrParseError};
+use std::net::AddrParseError;
 
 use bincode::{Decode, Encode};
-use bus::ReplicaMessageBus;
-use client::ClientConfig;
+use client::{Client, ClientConfig, ClientError};
 use io::{IOError, PollIO};
 use message::Operation;
-use replica::{Replica, ReplicaConfig, ReplicaError, quorum};
+use replica::{Replica, ReplicaConfig, ReplicaError};
 use thiserror::Error;
 
 /* VSR (Viewstamped Replication Revisited)
@@ -67,24 +66,29 @@ Recovery protocol
  3. The recovering replica waits to receiver at least `quorum + 1` messages from different replicas with the `nonce` value sent, including one from the primary of the latest view it learns of these messages. Then, it updates its state using the information from the primary, changes its status to normal and is available to receive more requests.
 */
 
-pub mod bus;
+mod bus;
 pub mod client;
-pub mod clock;
+mod clock;
 pub mod io;
-pub mod message;
+mod message;
 pub mod replica;
 
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
 pub(crate) const OPERATION_SIZE_MAX: usize = 1024;
 
+/// `ReplicaOptions` collect the available configuration options for a replica.
 pub struct ReplicaOptions {
     pub seed: u64,
+
+    /// The current replica index matching a position in `addresses`.
     pub current: usize,
+
+    /// Socket addresses of all the replicas (e.g. `127.0.0.1:3000`)
     pub addresses: Vec<String>,
 }
 
 impl ReplicaOptions {
-    pub fn parse(&self) -> Result<ReplicaConfig, InputError> {
+    fn parse(&self) -> Result<ReplicaConfig, InputError> {
         let mut socket_addresses = Vec::with_capacity(self.addresses.len());
         for address in &self.addresses {
             socket_addresses.push(address.parse()?);
@@ -99,10 +103,17 @@ impl ReplicaOptions {
     }
 }
 
+/// `ClientOptions` collect the available configuration options for a client.
 pub struct ClientOptions {
     pub seed: u64,
+
+    /// The address used by the client (e.g. `127.0.0.1:8000`)
     pub address: String,
+
+    /// An identifier for the client
     pub client_id: usize,
+
+    /// Socket addresses of all the replicas (e.g. `127.0.0.1:3000`)
     pub replicas: Vec<String>,
 }
 
@@ -122,42 +133,20 @@ impl ClientOptions {
     }
 }
 
-pub struct Cluster;
+/// Create a new replica given certain options and a service.
+pub fn replica<S: Service<Input = I, Output = O>, I: Decode<()>, O: Encode>(
+    options: &ReplicaOptions,
+    service: S,
+) -> Result<Replica<S, PollIO>, ReplicaError> {
+    let io = PollIO::new()?;
+    let config = options.parse().unwrap();
+    Ok(Replica::new(&config, service, io))
+}
 
-impl Cluster {
-    pub fn create_replica<S: Clone + Service<Input = I, Output = O>, I: Decode<()>, O: Encode>(
-        options: &ReplicaOptions,
-        service: S,
-    ) -> Result<Replica<S, PollIO>, ReplicaError> {
-        let total = options.addresses.len();
-        let config = options.parse().unwrap();
-
-        let io = PollIO::new()?;
-        let bus = ReplicaMessageBus::new(&config, io);
-
-        Ok(Replica::new(config.replica, total, service, bus))
-    }
-
-    pub fn primary<S, IO>(replicas: &Vec<Replica<S, IO>>) -> usize {
-        assert!(!replicas.is_empty());
-
-        let total = replicas.len();
-        let majority = quorum(total) + 1;
-
-        let mut views = HashMap::<usize, usize>::with_capacity(total);
-        for replica in replicas {
-            let count = views.entry(replica.view).or_default();
-            *count += 1;
-        }
-
-        for (view, count) in views {
-            if count >= majority {
-                return view;
-            }
-        }
-
-        panic!("Primary could not be found")
-    }
+/// Create a new client given certain options and known `view`.
+pub fn client(options: &ClientOptions, view: usize) -> Result<Client<PollIO>, ClientError> {
+    let io = PollIO::new()?;
+    Client::new(options, view, io)
 }
 
 #[derive(Error, Debug, PartialEq)]
@@ -178,10 +167,17 @@ pub enum ServiceError {
     IO(#[from] IOError),
 }
 
+/// The `Service` is the internal application layer of a `Replica`. Any service implementing this
+/// trait can be executed inside a replica.
 pub trait Service {
+    /// The input of the service. The input matches the request messages sent by the clients.
     type Input: Decode<()>;
+
+    /// The output of the service.
     type Output: Encode;
 
+    /// Execute the input against the service and returns an output which will be ultimately sent
+    /// to the client.
     fn execute(&self, input: Self::Input) -> Result<Self::Output, ServiceError>;
 
     fn execute_bytes(&self, input: &[u8]) -> Result<Operation, ServiceError> {

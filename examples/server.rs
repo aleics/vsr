@@ -1,40 +1,59 @@
-use vsr::{
-    ReplicaOptions,
-    bus::ReplicaMessageBus,
-    io::{IOError, PollIO},
-    message::{Message, Operation},
-};
+use std::thread;
 
-fn main() -> Result<(), IOError> {
-    let seed: u64 = 1234;
+use clap::{Parser, command};
+use vsr::{ReplicaOptions, Service, io::PollIO, replica::Replica};
 
-    let config = ReplicaOptions {
-        seed,
-        addresses: vec!["127.0.0.1:3000".to_string()],
-        current: 0,
-    }
-    .parse()
-    .unwrap();
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    #[arg(short, long, value_delimiter = ',')]
+    addresses: Vec<String>,
 
-    let io = PollIO::new().unwrap();
+    #[arg(short, long)]
+    seed: u64,
+}
 
-    let mut bus = ReplicaMessageBus::new(&config, io);
-    bus.init().unwrap();
+struct EchoService;
 
-    loop {
-        let messages = bus.tick()?;
-        for message in messages {
-            let Message::Request(request) = message else {
-                panic!("unexpected message type");
-            };
+impl Service for EchoService {
+    type Input = String;
+    type Output = String;
 
-            let incoming = bytes_as_string(request.operation);
-            println!("message received in replica 1: {}", incoming);
-        }
+    fn execute(&self, input: Self::Input) -> Result<Self::Output, vsr::ServiceError> {
+        println!("message received {input}");
+        Ok(format!("echo \"{}\"", input))
     }
 }
 
-fn bytes_as_string(value: Operation) -> String {
-    let (result, _) = bincode::decode_from_slice(&value, bincode::config::standard()).unwrap();
-    result
+fn start_replica(options: &ReplicaOptions) -> Replica<EchoService, PollIO> {
+    let mut replica = vsr::replica(options, EchoService).unwrap();
+    replica.init().unwrap();
+
+    replica
+}
+
+fn main() {
+    let args = Args::parse();
+
+    let total = args.addresses.len();
+    let mut handles = Vec::with_capacity(total);
+
+    for replica_number in 0..total {
+        let options = ReplicaOptions {
+            seed: args.seed,
+            addresses: args.addresses.clone(),
+            current: replica_number,
+        };
+
+        let replica = start_replica(&options);
+
+        handles.push(thread::spawn(move || {
+            println!("Replica {replica_number} running...");
+            replica.run().unwrap();
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }

@@ -305,7 +305,7 @@ enum ConnectionStatus {
 /// The message bus used by the replicas. The bus is in charge of accepting and
 /// closing connections to the source replica, as well as sending and receiving
 /// messages from other replicas and clients.
-pub struct ReplicaMessageBus<IO> {
+pub(crate) struct ReplicaMessageBus<IO> {
     address: SocketAddr,
 
     /// The socket used to listen for messages.
@@ -340,7 +340,7 @@ pub struct ReplicaMessageBus<IO> {
 
 impl<I: IO> ReplicaMessageBus<I> {
     /// Create a new instance of a message bus for the local replica.
-    pub fn new(config: &ReplicaConfig, io: I) -> Self {
+    pub(crate) fn new(config: &ReplicaConfig, io: I) -> Self {
         let current_address = config.addresses.get(config.replica).unwrap();
         let encoding_config = bincode::config::standard();
 
@@ -377,7 +377,7 @@ impl<I: IO> ReplicaMessageBus<I> {
 
     /// Initialize the bus and open a TCP address to allow incoming
     /// connections.
-    pub fn init(&mut self) -> Result<(), IOError> {
+    pub(crate) fn init(&mut self) -> Result<(), IOError> {
         self.socket = Some(self.io.open_tcp(self.address)?);
         self.connect_retry.init();
         Ok(())
@@ -542,7 +542,11 @@ impl<I: IO> ReplicaMessageBus<I> {
 
     /// Send a message to another replica in a non-blocking fashion. The message will be queued
     /// to the connection's outgoing buffer to be ultimately sent.
-    pub fn send_to_replica(&mut self, message: &Message, replica: &usize) -> Result<bool, IOError> {
+    pub(crate) fn send_to_replica(
+        &mut self,
+        message: &Message,
+        replica: &usize,
+    ) -> Result<bool, IOError> {
         let connection_id = self
             .replicas
             .get(replica)
@@ -600,7 +604,7 @@ impl<I: IO> ReplicaMessageBus<I> {
     /// Send a message to a client in a non-blocking fashion. The message will be queued
     /// to the connection's outgoing buffer to be ultimately sent. A boolean is returned
     /// in case the message was sent to the client or not.
-    pub fn send_to_client(
+    pub(crate) fn send_to_client(
         &mut self,
         message: ReplyMessage,
         client_id: &usize,
@@ -633,7 +637,7 @@ impl<I: IO> ReplicaMessageBus<I> {
 
     /// Trigger a tick iteration for the bus. In case messages were received from
     /// the incoming buffer, they are returned so the local replica can process them.
-    pub fn tick(&mut self) -> Result<Vec<Message>, IOError> {
+    pub(crate) fn tick(&mut self) -> Result<Vec<Message>, IOError> {
         self.connect_to_other_replicas();
         let messages = self.run_for_ns(TICK_TIMEOUT_NS)?;
         self.connect_retry.tick();
@@ -645,7 +649,7 @@ impl<I: IO> ReplicaMessageBus<I> {
 /// The message bus used by the client. The bus is in charge of accepting and
 /// closing connections to the client, as well as sending and receiving
 /// messages from replicas.
-pub struct ClientMessageBus<IO> {
+pub(crate) struct ClientMessageBus<IO> {
     /// The client's identifier
     client_id: usize,
 
@@ -677,7 +681,7 @@ pub struct ClientMessageBus<IO> {
 
 impl<I: IO> ClientMessageBus<I> {
     /// Create a new instance of a message bus for a client.
-    pub fn new(config: &ClientConfig, io: I) -> Self {
+    pub(crate) fn new(config: &ClientConfig, io: I) -> Self {
         let encoding_config = bincode::config::standard();
         let mut connections = ConnectionPool::new();
         let mut replicas = HashMap::with_capacity(config.replicas.len() - 1);
@@ -709,7 +713,7 @@ impl<I: IO> ClientMessageBus<I> {
 
     /// Initialize the bus and open a TCP address to allow incoming
     /// connections.
-    pub fn init(&mut self) -> Result<(), IOError> {
+    pub(crate) fn init(&mut self) -> Result<(), IOError> {
         self.socket = Some(self.io.open_tcp(self.address)?);
         self.connect_retry.init();
         Ok(())
@@ -878,7 +882,11 @@ impl<I: IO> ClientMessageBus<I> {
 
     /// Send a message to a replica in a non-blocking fashion. The message will be queued
     /// to the connection's outgoing buffer to be ultimately sent.
-    pub fn send_to_replica(&mut self, message: &Message, replica: &usize) -> Result<(), IOError> {
+    pub(crate) fn send_to_replica(
+        &mut self,
+        message: &Message,
+        replica: &usize,
+    ) -> Result<(), IOError> {
         let connection_id = self
             .replicas
             .get(replica)
@@ -933,7 +941,7 @@ impl<I: IO> ClientMessageBus<I> {
 
     /// Trigger a tick iteration for the bus. In case messages were received from
     /// the incoming buffer, they are returned so the client can process them.
-    pub fn tick(&mut self) -> Result<Vec<Message>, IOError> {
+    pub(crate) fn tick(&mut self) -> Result<Vec<Message>, IOError> {
         self.connect_to_replicas();
         let messages = self.run_for_ns(TICK_TIMEOUT_NS)?;
         self.connect_retry.tick();

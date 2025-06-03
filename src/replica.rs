@@ -27,7 +27,7 @@ const COMMIT_TIMEOUT_MS: Duration = Duration::from_millis(200);
 const IDLE_TIMEOUT_MS: Duration = Duration::from_millis(2000);
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ReplicaConfig {
+pub(crate) struct ReplicaConfig {
     pub(crate) seed: u64,
 
     /// The current replica number given the configuration.
@@ -99,16 +99,13 @@ where
     O: Encode,
     IO: crate::io::IO,
 {
-    pub(crate) fn new(
-        replica_number: usize,
-        total: usize,
-        service: S,
-        bus: ReplicaMessageBus<IO>,
-    ) -> Self {
+    pub(crate) fn new(config: &ReplicaConfig, service: S, io: IO) -> Self {
+        let bus = ReplicaMessageBus::new(config, io);
+
         Replica {
-            replica_number,
+            replica_number: config.replica,
             view: 0,
-            total,
+            total: config.addresses.len(),
             status: ReplicaStatus::Normal,
             operation_number: 0,
             log: Log::new(),
@@ -1148,7 +1145,6 @@ mod tests {
 
     use crate::{
         Operation, ReplicaOptions,
-        bus::ReplicaMessageBus,
         io::{AcceptedConnection, IO},
         message::{
             CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
@@ -1250,12 +1246,7 @@ mod tests {
 
             let config = options.parse().unwrap();
 
-            Replica::new(
-                self.replica_number,
-                total,
-                MockService,
-                ReplicaMessageBus::new(&config, MockIO),
-            )
+            Replica::new(&config, MockService, MockIO)
         }
     }
 

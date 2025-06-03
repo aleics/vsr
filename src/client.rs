@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClientConfig {
+pub(crate) struct ClientConfig {
     pub(crate) seed: u64,
     pub(crate) client_id: usize,
     pub(crate) address: SocketAddr,
@@ -33,8 +33,7 @@ pub struct Client<IO> {
 }
 
 impl Client<PollIO> {
-    pub fn new(options: &ClientOptions, view: usize) -> Result<Self, ClientError> {
-        let io = PollIO::new()?;
+    pub fn new(options: &ClientOptions, view: usize, io: PollIO) -> Result<Self, ClientError> {
         let config = options.parse()?;
 
         let bus = ClientMessageBus::new(&config, io);
