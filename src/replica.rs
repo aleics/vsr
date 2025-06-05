@@ -499,7 +499,7 @@ where
         });
 
         // Send message to the next replica in the circle
-        let next_replica = self.next_replica(self.replica_number);
+        let next_replica = next_replica(self.replica_number);
         Ok(HandleOutput::send(message, next_replica))
     }
 
@@ -885,7 +885,7 @@ where
             return Ok(HandleOutput::DoNothing);
         }
 
-        self.view = self.next_replica(self.view);
+        self.view = next_replica(self.view);
         self.status = ReplicaStatus::ViewChange;
 
         let message = Message::StartViewChange(StartViewChangeMessage {
@@ -911,10 +911,10 @@ where
     fn is_primary(&self) -> bool {
         (self.view % self.total) == self.replica_number
     }
+}
 
-    fn next_replica(&self, replica_number: usize) -> usize {
-        replica_number + 1
-    }
+fn next_replica(replica_number: usize) -> usize {
+    replica_number + 1
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1141,6 +1141,7 @@ mod tests {
         time::Instant,
     };
 
+    use bytes::{Bytes, BytesMut};
     use mio::net::{TcpListener, TcpStream};
 
     use crate::{
@@ -1187,11 +1188,11 @@ mod tests {
             unreachable!()
         }
 
-        fn recv(&self, _: &mut TcpStream, _: &mut Vec<u8>) -> Result<bool, crate::io::IOError> {
+        fn recv(&self, _: &mut TcpStream, _: &mut BytesMut) -> Result<bool, crate::io::IOError> {
             unreachable!()
         }
 
-        fn write(&self, _: &mut TcpStream, _: &[u8]) -> Result<Option<usize>, crate::io::IOError> {
+        fn write(&self, _: &mut TcpStream, _: &Bytes) -> Result<Option<usize>, crate::io::IOError> {
             unreachable!()
         }
 

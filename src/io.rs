@@ -1,6 +1,7 @@
 use std::{io::Read, net::SocketAddr};
 use std::{io::Write, time::Duration};
 
+use bytes::{Bytes, BytesMut};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use thiserror::Error;
@@ -46,14 +47,14 @@ pub trait IO {
 
     /// Receive a new message in the socket. The result is stored in the buffer provided as a mutable reference.
     /// A boolean is returned if the connection mus be closed or not.
-    fn recv(&self, socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<bool, IOError>;
+    fn recv(&self, socket: &mut TcpStream, buffer: &mut BytesMut) -> Result<bool, IOError>;
 
     /// Send a new message to the provided socket. This is used as a first step. Once the non-blocking connection
     /// is available to write the message, the `IO::write` should be used.
     fn send(&self, socket: &mut TcpStream, connection_id: usize) -> Result<(), IOError>;
 
     /// Write a certain amount of bytes to a socket.
-    fn write(&self, socket: &mut TcpStream, bytes: &[u8]) -> Result<Option<usize>, IOError>;
+    fn write(&self, socket: &mut TcpStream, bytes: &Bytes) -> Result<Option<usize>, IOError>;
 
     /// Run any IO operations with a certain timeout.
     fn run(&mut self, timeout: Duration) -> Result<Vec<Completion>, IOError>;
@@ -149,7 +150,7 @@ impl IO for PollIO {
         Ok(())
     }
 
-    fn recv(&self, socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<bool, IOError> {
+    fn recv(&self, socket: &mut TcpStream, buffer: &mut BytesMut) -> Result<bool, IOError> {
         let mut buf = [0; MESSAGE_SIZE_MAX];
 
         loop {
@@ -181,7 +182,7 @@ impl IO for PollIO {
         Ok(())
     }
 
-    fn write(&self, socket: &mut TcpStream, bytes: &[u8]) -> Result<Option<usize>, IOError> {
+    fn write(&self, socket: &mut TcpStream, bytes: &Bytes) -> Result<Option<usize>, IOError> {
         let written = match socket.write(bytes) {
             Ok(0) => Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => Ok(n),

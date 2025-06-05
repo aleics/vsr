@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bincode = "2.0.1"
+bytes = "1.10.1"
 crossbeam = "0.8.4"
 mio = { version = "1.0.4", features = ["os-poll", "net"] }
 rand = "0.9.1"

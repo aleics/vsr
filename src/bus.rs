@@ -1,4 +1,5 @@
 use bincode::config::Configuration;
+use bytes::{Buf, Bytes, BytesMut};
 use mio::net::{TcpListener, TcpStream};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -137,7 +138,7 @@ fn compute_jittered_backoff(attempt: u32, min: u64, max: u64, rng: &mut ChaCha8R
 /// to be sent over to another replica / client.
 #[derive(Debug, Default)]
 struct OutgoingBuffer {
-    pub(crate) send_queue: VecDeque<Vec<u8>>,
+    pub(crate) send_queue: VecDeque<Bytes>,
 }
 
 impl OutgoingBuffer {
@@ -146,12 +147,12 @@ impl OutgoingBuffer {
     }
 
     /// Add a message in the outgoing buffer's queue.
-    fn add(&mut self, message_bytes: Vec<u8>) {
+    fn add(&mut self, message_bytes: Bytes) {
         self.send_queue.push_back(message_bytes);
     }
 
     /// Pop out the first message from the queue.
-    fn pop(&mut self) -> Option<Vec<u8>> {
+    fn pop(&mut self) -> Option<Bytes> {
         self.send_queue.pop_front()
     }
 }
@@ -175,7 +176,7 @@ struct Connection {
     outgoing_buffer: OutgoingBuffer,
 
     /// The incoming buffer for message coming from the target.
-    incoming_buffer: Vec<u8>,
+    incoming_buffer: BytesMut,
 
     /// The `bincode` configuration used to encode / decode messages.
     encoding_config: Configuration,
@@ -190,7 +191,7 @@ impl Connection {
             socket: None,
             peer: None,
             outgoing_buffer: OutgoingBuffer::new(),
-            incoming_buffer: Vec::new(),
+            incoming_buffer: BytesMut::new(),
             encoding_config: config,
         }
     }
@@ -546,7 +547,7 @@ impl<I: IO> ReplicaMessageBus<I> {
                 self.clients.remove(&id);
             }
             Some(ConnectionPeer::Unknown) | None => {}
-        };
+        }
 
         Ok(())
     }
@@ -604,8 +605,7 @@ impl<I: IO> ReplicaMessageBus<I> {
                 let Some(written) = self.io.write(socket, &buffer)? else {
                     return Ok(true);
                 };
-
-                buffer.drain(..written);
+                buffer.advance(written);
             }
         }
 
@@ -953,8 +953,7 @@ impl<I: IO> ClientMessageBus<I> {
                 let Some(written) = self.io.write(socket, &buffer)? else {
                     return Ok(true);
                 };
-
-                buffer.drain(..written);
+                buffer.advance(written);
             }
         }
 

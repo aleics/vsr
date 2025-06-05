@@ -1,10 +1,15 @@
+use std::io::Cursor;
+
 use bincode::{
     Decode, Encode,
     config::Configuration,
     error::{DecodeError, EncodeError},
 };
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{OPERATION_SIZE_MAX, replica::Log};
+
+const HEADER_SIZE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) enum Message {
@@ -25,34 +30,40 @@ pub(crate) enum Message {
 impl Message {
     /// Encode the [`Message`] in binary, by appending the message with its size
     /// (framing), so that only the necessary bit size is used when decoding.
-    pub(crate) fn encode(&self, config: Configuration) -> Result<Vec<u8>, EncodeError> {
-        let encoded = bincode::encode_to_vec(self, config)?;
+    pub(crate) fn encode(&self, config: Configuration) -> Result<Bytes, EncodeError> {
+        let payload = bincode::encode_to_vec(self, config)?;
+        let mut buf = BytesMut::with_capacity(payload.len() + HEADER_SIZE);
 
         // Append the encoded content with its length
-        let mut frame = (encoded.len() as u32).to_be_bytes().to_vec();
-        frame.extend_from_slice(&encoded);
-        Ok(frame)
+        buf.put_u32(payload.len() as u32);
+        buf.extend_from_slice(&payload);
+
+        Ok(buf.freeze())
     }
 
     /// Decode the given bytes into a [`Message`] using the framing implemented
     /// in [`Message::encode`]
     pub(crate) fn decode(
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         config: Configuration,
     ) -> Result<Option<Message>, DecodeError> {
-        if buf.len() < 4 {
+        if buf.len() < HEADER_SIZE {
             return Ok(None);
         }
 
         // Read the first 4 bytes (`u32`) containing the size of the message
-        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if buf.len() < 4 + len {
+        let mut cursor = Cursor::new(&buf[..HEADER_SIZE]);
+        let length = cursor.get_u32() as usize;
+
+        if buf.len() < HEADER_SIZE + length {
             return Ok(None);
         }
 
-        // Decode the message
-        let (message, _) = bincode::decode_from_slice(&buf[4..4 + len], config)?;
-        buf.drain(..4 + len);
+        // Decode the message's payload
+        buf.advance(HEADER_SIZE);
+        let payload = buf.split_to(length);
+
+        let (message, _) = bincode::decode_from_slice(&payload.freeze(), config)?;
         Ok(Some(message))
     }
 }
