@@ -1,13 +1,14 @@
 use std::io::Cursor;
 
 use bincode::{
-    Decode, Encode,
+    BorrowDecode, Decode, Encode,
     config::Configuration,
+    de::{BorrowDecoder, Decoder},
     error::{DecodeError, EncodeError},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{OPERATION_SIZE_MAX, replica::Log};
+use crate::replica::Log;
 
 const HEADER_SIZE: usize = 4;
 
@@ -32,7 +33,12 @@ impl Message {
     /// (framing), so that only the necessary bit size is used when decoding.
     pub(crate) fn encode(&self, config: Configuration) -> Result<Bytes, EncodeError> {
         let payload = bincode::encode_to_vec(self, config)?;
-        let mut buf = BytesMut::with_capacity(payload.len() + HEADER_SIZE);
+        if payload.is_empty() {
+            return Ok(Bytes::new());
+        }
+
+        let message_size = payload.len() + HEADER_SIZE;
+        let mut buf = BytesMut::with_capacity(message_size);
 
         // Append the encoded content with its length
         buf.put_u32(payload.len() as u32);
@@ -168,4 +174,73 @@ pub(crate) struct ReplyMessage {
     pub(crate) result: Operation,
 }
 
-pub(crate) type Operation = [u8; OPERATION_SIZE_MAX];
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Operation {
+    pub(crate) content: Bytes,
+}
+
+impl From<Bytes> for Operation {
+    fn from(value: Bytes) -> Self {
+        Operation { content: value }
+    }
+}
+
+impl Encode for Operation {
+    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        bincode::Encode::encode(self.content.as_ref(), encoder)
+    }
+}
+
+impl<Context> Decode<Context> for Operation {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let bytes: Vec<u8> = Decode::decode(decoder)?;
+        Ok(Operation::from(Bytes::from(bytes)))
+    }
+}
+
+impl<'de, Context> BorrowDecode<'de, Context> for Operation {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
+        let bytes: &[u8] = bincode::BorrowDecode::borrow_decode(decoder)?;
+        Ok(Operation::from(Bytes::copy_from_slice(bytes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Bytes, BytesMut};
+
+    use crate::{
+        Operation,
+        message::{Message, RequestMessage},
+    };
+
+    #[test]
+    fn encodes_decodes_single_message() {
+        // given
+        let message = Message::Request(RequestMessage {
+            view: 0,
+            request_number: 0,
+            client_id: 0,
+            operation: Operation::from(Bytes::from(vec![1, 2, 3])),
+        });
+        let config = bincode::config::standard();
+
+        // when
+        let encoded = message.encode(config).unwrap();
+        let mut encoded = BytesMut::from(encoded);
+        let decoded = Message::decode(&mut encoded, config).unwrap();
+
+        // then
+        assert_eq!(
+            decoded,
+            Some(Message::Request(RequestMessage {
+                view: 0,
+                request_number: 0,
+                client_id: 0,
+                operation: Operation::from(Bytes::from(vec![1, 2, 3])),
+            }))
+        );
+    }
+}

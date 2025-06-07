@@ -1,6 +1,7 @@
 use std::net::AddrParseError;
 
 use bincode::{Decode, Encode};
+use bytes::Bytes;
 use client::{Client, ClientConfig, ClientError};
 use io::{IOError, PollIO};
 use message::Operation;
@@ -15,7 +16,6 @@ mod message;
 pub mod replica;
 
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
-pub(crate) const OPERATION_SIZE_MAX: usize = 1024;
 
 /// `ReplicaOptions` collect the available configuration options for a replica.
 pub struct ReplicaOptions {
@@ -121,21 +121,21 @@ pub trait Service {
     /// to the client.
     fn execute(&self, input: Self::Input) -> Result<Self::Output, ServiceError>;
 
-    fn execute_bytes(&self, input: &[u8]) -> Result<Operation, ServiceError> {
-        let input = decode(input)?;
+    fn execute_bytes(&self, input: &Operation) -> Result<Operation, ServiceError> {
+        let input = decode_operation(input)?;
         let output = self.execute(input)?;
 
-        Ok(encode(output)?)
+        Ok(encode_operation(output)?)
     }
 }
 
-fn encode<T: Encode>(value: T) -> Result<Operation, IOError> {
-    let mut buf = [0; OPERATION_SIZE_MAX];
-    bincode::encode_into_slice(value, &mut buf, bincode::config::standard())?;
-    Ok(buf)
+fn encode_operation<T: Encode>(value: T) -> Result<Operation, IOError> {
+    let buf = bincode::encode_to_vec(value, bincode::config::standard())?;
+    Ok(Operation::from(Bytes::from(buf)))
 }
 
-fn decode<T: Decode<()>>(value: &[u8]) -> Result<T, IOError> {
-    let (result, _) = bincode::decode_from_slice(value, bincode::config::standard())?;
+fn decode_operation<T: Decode<()>>(value: &Operation) -> Result<T, IOError> {
+    let (result, _) =
+        bincode::decode_from_slice(value.content.as_ref(), bincode::config::standard())?;
     Ok(result)
 }

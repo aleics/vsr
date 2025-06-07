@@ -557,11 +557,11 @@ impl<I: IO> ReplicaMessageBus<I> {
     pub(crate) fn send_to_replica(
         &mut self,
         message: &Message,
-        replica: &usize,
+        replica: usize,
     ) -> Result<bool, IOError> {
         let connection_id = self
             .replicas
-            .get(replica)
+            .get(&replica)
             .unwrap_or_else(|| panic!("Replica not found (from: {}, to: {replica})", self.replica));
 
         let connection = self.connection_pool.get_mut(*connection_id)
@@ -618,11 +618,11 @@ impl<I: IO> ReplicaMessageBus<I> {
     pub(crate) fn send_to_client(
         &mut self,
         reply: ReplyMessage,
-        client_id: &usize,
+        client_id: usize,
     ) -> Result<bool, IOError> {
         let connection_id = self
             .clients
-            .get(client_id)
+            .get(&client_id)
             .unwrap_or_else(|| panic!("Client not found (client: {client_id})"));
 
         let connection = self.connection_pool.get_mut(*connection_id)
@@ -907,11 +907,11 @@ impl<I: IO> ClientMessageBus<I> {
     pub(crate) fn send_to_replica(
         &mut self,
         message: &Message,
-        replica: &usize,
+        replica: usize,
     ) -> Result<(), IOError> {
         let connection_id = self
             .replicas
-            .get(replica)
+            .get(&replica)
             .unwrap_or_else(|| panic!("Replica not found (replica: {replica})"));
 
         let connection = self.connection_pool.get_mut(*connection_id)

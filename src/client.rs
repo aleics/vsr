@@ -4,8 +4,9 @@ use bincode::{Decode, Encode};
 use thiserror::Error;
 
 use crate::{
-    ClientOptions, InputError, OPERATION_SIZE_MAX,
+    ClientOptions, InputError,
     bus::ClientMessageBus,
+    decode_operation, encode_operation,
     io::{IOError, PollIO},
     message::{Message, RequestMessage},
 };
@@ -57,19 +58,15 @@ impl Client<PollIO> {
     pub fn send<I: Encode>(&mut self, operation: I) -> Result<(), ClientError> {
         let mut request_number = self.next_request_number.borrow_mut();
 
-        let mut buf = [0; OPERATION_SIZE_MAX];
-        bincode::encode_into_slice(operation, &mut buf, bincode::config::standard())
-            .map_err(IOError::Encode)?;
-
         let message = RequestMessage {
             client_id: self.config.client_id,
             view: self.view,
             request_number: *request_number,
-            operation: buf,
+            operation: encode_operation(operation)?,
         };
 
         self.bus
-            .send_to_replica(&Message::Request(message), &self.view)?;
+            .send_to_replica(&Message::Request(message), self.view)?;
 
         *request_number += 1;
 
@@ -85,10 +82,7 @@ impl Client<PollIO> {
                 continue;
             };
 
-            let (response, _) =
-                bincode::decode_from_slice(&reply.result, bincode::config::standard())
-                    .map_err(IOError::Decode)?;
-
+            let response = decode_operation(&reply.result)?;
             responses.push(response);
         }
 

@@ -159,7 +159,7 @@ where
                     match action {
                         OutputAction::Broadcast { message } => self.broadcast(&message)?,
                         OutputAction::Send { message, replica } => {
-                            let sent = self.bus.send_to_replica(&message, &replica)?;
+                            let sent = self.bus.send_to_replica(&message, replica)?;
                             if !sent {
                                 tracing::error!(
                                     "Message could not be sent replica (from: {}, to: {})",
@@ -169,7 +169,7 @@ where
                             }
                         }
                         OutputAction::SendClient { reply, client_id } => {
-                            let sent = self.bus.send_to_client(reply, &client_id)?;
+                            let sent = self.bus.send_to_client(reply, client_id)?;
                             if !sent {
                                 tracing::error!(
                                     "Message could not be sent client (replica: {}, client: {})",
@@ -190,7 +190,7 @@ where
         // For all the replicas except itself
         for i in 0..self.total {
             if i != self.replica_number {
-                self.bus.send_to_replica(message, &i)?;
+                self.bus.send_to_replica(message, i)?;
             }
         }
 
@@ -284,11 +284,11 @@ where
             }
 
             if most_recent_request.request_number == request.request_number {
-                if let Some(result) = most_recent_request.response {
+                if let Some(result) = &most_recent_request.response {
                     let message = ReplyMessage {
                         view: request.view,
                         request_number: most_recent_request.request_number,
-                        result,
+                        result: result.clone(),
                     };
                     return Ok(HandleOutput::send_client(message, request.client_id));
                 }
@@ -300,8 +300,11 @@ where
         assert!(self.operation_number == self.log.size());
 
         self.operation_number += 1;
-        self.log
-            .append(request.operation, request.request_number, request.client_id);
+        self.log.append(
+            request.operation.clone(),
+            request.request_number,
+            request.client_id,
+        );
         self.client_table.insert(
             request.client_id,
             ClientTableEntry {
@@ -435,7 +438,7 @@ where
             .expect("Client must be present in the client table since the request message has been already received");
 
         // The primary also updates the client's entry in the client-table to contain the result
-        client_request.response = Some(result);
+        client_request.response = Some(result.clone());
 
         // Send reply message to the client
         Ok(HandleOutput::send_client(
@@ -639,7 +642,7 @@ where
                     reply: ReplyMessage {
                         view: self.view,
                         request_number: log_entry.request_number,
-                        result,
+                        result: result.clone(),
                     },
                     client_id: log_entry.client_id,
                 });
@@ -1145,7 +1148,7 @@ mod tests {
     use mio::net::{TcpListener, TcpStream};
 
     use crate::{
-        Operation, ReplicaOptions,
+        Operation, ReplicaOptions, encode_operation,
         io::{AcceptedConnection, IO},
         message::{
             CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
@@ -1269,9 +1272,7 @@ mod tests {
     }
 
     fn usize_as_bytes(value: usize) -> Operation {
-        let mut buffer = [0; 1024];
-        bincode::encode_into_slice(value, &mut buffer, bincode::config::standard()).unwrap();
-        buffer
+        encode_operation(value).unwrap()
     }
 
     #[test]
@@ -1282,7 +1283,7 @@ mod tests {
             view: 0,
             request_number: 1,
             client_id: 1,
-            operation,
+            operation: operation.clone(),
         });
         let mut replica = MockReplicaBuilder::new().build();
 
@@ -1300,7 +1301,7 @@ mod tests {
                     view: 0,
                     request_number: 1,
                     client_id: 1,
-                    operation,
+                    operation: operation.clone(),
                 },
             }))
         );
@@ -1415,7 +1416,7 @@ mod tests {
                 view: 0,
                 request_number: 1,
                 client_id: 1,
-                operation,
+                operation: operation.clone(),
             },
         });
         let mut replica = MockReplicaBuilder::new().backup().build();
@@ -1470,7 +1471,7 @@ mod tests {
                 view: 0,
                 request_number: 2,
                 client_id: 1,
-                operation,
+                operation: operation.clone(),
             },
         });
         let mut replica = MockReplicaBuilder::new().backup().build();
