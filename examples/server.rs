@@ -26,7 +26,8 @@ impl Service for EchoService {
 }
 
 fn start_replica(options: &ReplicaOptions) -> Replica<EchoService, PollIO> {
-    let mut replica = vsr::replica(options, EchoService).unwrap();
+    let io = PollIO::new().unwrap();
+    let mut replica = vsr::replica(options, EchoService, io).unwrap();
     replica.init().unwrap();
 
     replica

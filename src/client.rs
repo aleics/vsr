@@ -7,21 +7,21 @@ use crate::{
     ClientOptions, InputError,
     bus::ClientMessageBus,
     decode_operation, encode_operation,
-    io::{IOError, PollIO},
+    io::IOError,
     message::{Message, RequestMessage},
 };
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ClientConfig {
-    pub(crate) seed: u64,
-    pub(crate) client_id: usize,
-    pub(crate) address: SocketAddr,
-    pub(crate) replicas: Vec<SocketAddr>,
+pub struct ClientConfig {
+    pub seed: u64,
+    pub client_id: usize,
+    pub address: SocketAddr,
+    pub replicas: Vec<SocketAddr>,
 }
 
 pub struct Client<IO: crate::io::IO> {
     /// Client identification
-    config: ClientConfig,
+    pub config: ClientConfig,
 
     /// Internal view number of the replica
     view: usize,
@@ -33,8 +33,8 @@ pub struct Client<IO: crate::io::IO> {
     bus: ClientMessageBus<IO>,
 }
 
-impl Client<PollIO> {
-    pub fn new(options: &ClientOptions, view: usize, io: PollIO) -> Result<Self, ClientError> {
+impl<IO: crate::io::IO> Client<IO> {
+    pub fn new(options: &ClientOptions, view: usize, io: IO) -> Result<Self, ClientError> {
         let config = options.parse()?;
 
         let bus = ClientMessageBus::new(&config, io);

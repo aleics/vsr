@@ -27,7 +27,8 @@ fn random(max: u64) -> u64 {
 }
 
 fn start_client(options: &ClientOptions) -> Client<PollIO> {
-    let mut client = vsr::client(options, 0).unwrap();
+    let io = PollIO::new().unwrap();
+    let mut client = vsr::client(options, 0, io).unwrap();
     client.init().unwrap();
 
     client

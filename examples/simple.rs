@@ -3,6 +3,7 @@ use std::thread::{self, sleep};
 use std::time::Duration;
 
 use bincode::{Decode, Encode};
+use vsr::io::PollIO;
 use vsr::{ClientOptions, ReplicaOptions, Service, ServiceError};
 
 #[derive(Debug)]
@@ -65,11 +66,13 @@ fn main() {
             addresses: replica_addresses.clone(),
         };
 
+        let io = PollIO::new().unwrap();
         let mut replica = vsr::replica(
             &replica_options,
             Counter {
                 value: Mutex::new(1),
             },
+            io,
         )
         .unwrap();
 
@@ -87,7 +90,8 @@ fn main() {
 
     sleep(Duration::from_secs(1));
 
-    let mut client = vsr::client(&client_options, 0).unwrap();
+    let io = PollIO::new().unwrap();
+    let mut client = vsr::client(&client_options, 0, io).unwrap();
     client.init().unwrap();
 
     while !client.is_ready() {

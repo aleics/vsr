@@ -3,7 +3,7 @@ use std::net::AddrParseError;
 use bincode::{Decode, Encode};
 use bytes::Bytes;
 use client::{Client, ClientConfig, ClientError};
-use io::{IOError, PollIO};
+use io::IOError;
 use message::Operation;
 use replica::{Replica, ReplicaConfig, ReplicaError};
 use thiserror::Error;
@@ -73,18 +73,21 @@ impl ClientOptions {
 }
 
 /// Create a new replica given certain options and a service.
-pub fn replica<S: Service<Input = I, Output = O>, I: Decode<()>, O: Encode>(
+pub fn replica<S: Service<Input = I, Output = O>, I: Decode<()>, O: Encode, IO: crate::io::IO>(
     options: &ReplicaOptions,
     service: S,
-) -> Result<Replica<S, PollIO>, ReplicaError> {
-    let io = PollIO::new()?;
+    io: IO,
+) -> Result<Replica<S, IO>, ReplicaError> {
     let config = options.parse().unwrap();
     Ok(Replica::new(&config, service, io))
 }
 
 /// Create a new client given certain options and known `view`.
-pub fn client(options: &ClientOptions, view: usize) -> Result<Client<PollIO>, ClientError> {
-    let io = PollIO::new()?;
+pub fn client<IO: crate::io::IO>(
+    options: &ClientOptions,
+    view: usize,
+    io: IO,
+) -> Result<Client<IO>, ClientError> {
     Client::new(options, view, io)
 }
 
