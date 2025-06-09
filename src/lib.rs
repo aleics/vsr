@@ -15,8 +15,6 @@ pub mod io;
 mod message;
 pub mod replica;
 
-pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
-
 /// `ReplicaOptions` collect the available configuration options for a replica.
 pub struct ReplicaOptions {
     pub seed: u64,

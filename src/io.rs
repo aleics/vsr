@@ -6,7 +6,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use thiserror::Error;
 
-use crate::MESSAGE_SIZE_MAX;
+use crate::message::MESSAGE_SIZE_MAX;
 
 const SERVER: Token = Token(0);
 const EVENTS_CAPACITY: usize = 128;
@@ -20,41 +20,58 @@ pub enum Completion {
     Write { connection: usize },
 }
 
-pub struct AcceptedConnection {
-    pub(crate) socket: TcpStream,
+pub struct AcceptedConnection<S> {
+    pub(crate) socket: S,
     pub(crate) connection_id: usize,
 }
 
+pub trait SocketLink {
+    /// Returns the address from the socket's source.
+    fn peer_addr(&self) -> Result<SocketAddr, std::io::Error>;
+}
+
+impl SocketLink for TcpStream {
+    fn peer_addr(&self) -> Result<SocketAddr, std::io::Error> {
+        self.peer_addr()
+    }
+}
+
 pub trait IO {
+    /// The type of local server being used to open and accept links.
+    type Local;
+
+    /// The link used between the local and a remote peer.
+    type Link: SocketLink;
+
     /// Open a TCP connection to a given address.
-    fn open_tcp(&self, addr: SocketAddr) -> Result<TcpListener, IOError>;
+    fn open_tcp(&self, addr: SocketAddr) -> Result<Self::Local, IOError>;
 
     /// Connect to a given address using a connection identifier.
     fn connect(
         &mut self,
         addr: SocketAddr,
         connection_id: usize,
-    ) -> Result<Option<TcpStream>, IOError>;
+    ) -> Result<Option<Self::Link>, IOError>;
 
     /// Accept an incoming connection to the provided listener.
     fn accept(
         &mut self,
-        socket: &TcpListener,
+        socket: &Self::Local,
         connection_id: usize,
-    ) -> Result<Vec<AcceptedConnection>, IOError>;
+    ) -> Result<Vec<AcceptedConnection<Self::Link>>, IOError>;
 
-    fn close(&self, socket: &mut TcpStream) -> Result<(), IOError>;
+    fn close(&self, socket: &mut Self::Link) -> Result<(), IOError>;
 
     /// Receive a new message in the socket. The result is stored in the buffer provided as a mutable reference.
     /// A boolean is returned if the connection mus be closed or not.
-    fn recv(&self, socket: &mut TcpStream, buffer: &mut BytesMut) -> Result<bool, IOError>;
+    fn recv(&self, socket: &mut Self::Link, buffer: &mut BytesMut) -> Result<bool, IOError>;
 
     /// Send a new message to the provided socket. This is used as a first step. Once the non-blocking connection
     /// is available to write the message, the `IO::write` should be used.
-    fn send(&self, socket: &mut TcpStream, connection_id: usize) -> Result<(), IOError>;
+    fn send(&self, socket: &mut Self::Link, connection_id: usize) -> Result<(), IOError>;
 
     /// Write a certain amount of bytes to a socket.
-    fn write(&self, socket: &mut TcpStream, bytes: &Bytes) -> Result<Option<usize>, IOError>;
+    fn write(&self, socket: &mut Self::Link, bytes: &Bytes) -> Result<Option<usize>, IOError>;
 
     /// Run any IO operations with a certain timeout.
     fn run(&mut self, timeout: Duration) -> Result<Vec<Completion>, IOError>;
@@ -77,7 +94,10 @@ impl PollIO {
 }
 
 impl IO for PollIO {
-    fn open_tcp(&self, addr: SocketAddr) -> Result<TcpListener, IOError> {
+    type Link = TcpStream;
+    type Local = TcpListener;
+
+    fn open_tcp(&self, addr: SocketAddr) -> Result<Self::Local, IOError> {
         let mut listener = TcpListener::bind(addr)?;
 
         self.poll
@@ -91,7 +111,7 @@ impl IO for PollIO {
         &mut self,
         addr: SocketAddr,
         connection_id: usize,
-    ) -> Result<Option<TcpStream>, IOError> {
+    ) -> Result<Option<Self::Link>, IOError> {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
                 self.poll.registry().register(
@@ -109,9 +129,9 @@ impl IO for PollIO {
 
     fn accept(
         &mut self,
-        socket: &TcpListener,
+        socket: &Self::Local,
         connection_id: usize,
-    ) -> Result<Vec<AcceptedConnection>, IOError> {
+    ) -> Result<Vec<AcceptedConnection<Self::Link>>, IOError> {
         assert!(connection_id != SERVER.0);
 
         let mut accepted = Vec::new();
@@ -144,13 +164,13 @@ impl IO for PollIO {
         Ok(accepted)
     }
 
-    fn close(&self, socket: &mut TcpStream) -> Result<(), IOError> {
+    fn close(&self, socket: &mut Self::Link) -> Result<(), IOError> {
         self.poll.registry().deregister(socket)?;
 
         Ok(())
     }
 
-    fn recv(&self, socket: &mut TcpStream, buffer: &mut BytesMut) -> Result<bool, IOError> {
+    fn recv(&self, socket: &mut Self::Link, buffer: &mut BytesMut) -> Result<bool, IOError> {
         let mut buf = [0; MESSAGE_SIZE_MAX];
 
         loop {
@@ -172,7 +192,7 @@ impl IO for PollIO {
         Ok(false)
     }
 
-    fn send(&self, socket: &mut TcpStream, connection_id: usize) -> Result<(), IOError> {
+    fn send(&self, socket: &mut Self::Link, connection_id: usize) -> Result<(), IOError> {
         self.poll.registry().reregister(
             socket,
             Token(connection_id),
@@ -182,7 +202,7 @@ impl IO for PollIO {
         Ok(())
     }
 
-    fn write(&self, socket: &mut TcpStream, bytes: &Bytes) -> Result<Option<usize>, IOError> {
+    fn write(&self, socket: &mut Self::Link, bytes: &Bytes) -> Result<Option<usize>, IOError> {
         let written = match socket.write(bytes) {
             Ok(0) => Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => Ok(n),

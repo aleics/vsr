@@ -19,7 +19,7 @@ pub(crate) struct ClientConfig {
     pub(crate) replicas: Vec<SocketAddr>,
 }
 
-pub struct Client<IO> {
+pub struct Client<IO: crate::io::IO> {
     /// Client identification
     config: ClientConfig,
 

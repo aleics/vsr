@@ -1,6 +1,5 @@
 use bincode::config::Configuration;
 use bytes::{Buf, Bytes, BytesMut};
-use mio::net::{TcpListener, TcpStream};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::collections::VecDeque;
@@ -9,16 +8,13 @@ use std::{cmp, collections::HashMap, time::Duration};
 
 use crate::client::ClientConfig;
 use crate::io::IOError;
+use crate::io::SocketLink;
 use crate::message::{
     CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
     PrepareOkMessage, RecoveryMessage, RecoveryResponseMessage, ReplyMessage,
     StartViewChangeMessage, StartViewMessage,
 };
-use crate::{
-    ReplicaConfig,
-    clock::Timeout,
-    io::{Completion, IO},
-};
+use crate::{ReplicaConfig, clock::Timeout, io::Completion};
 
 /// The identifier used by the retry timeout used for connecting
 /// to replicas / clients.
@@ -158,7 +154,7 @@ impl OutgoingBuffer {
 }
 
 /// A `Connection` describes the connection between replicas / clients.
-struct Connection {
+struct Connection<Socket> {
     /// The target address of the connection.
     address: SocketAddr,
 
@@ -166,7 +162,7 @@ struct Connection {
     status: ConnectionStatus,
 
     /// The socket used to communicate to the target replica / client.
-    socket: Option<TcpStream>,
+    socket: Option<Socket>,
 
     /// The connection peer identifying the target.
     peer: Option<ConnectionPeer>,
@@ -182,7 +178,7 @@ struct Connection {
     encoding_config: Configuration,
 }
 
-impl Connection {
+impl<S> Connection<S> {
     /// Create a new connection without a peer.
     fn new(address: SocketAddr, config: Configuration) -> Self {
         Connection {
@@ -248,14 +244,16 @@ impl ConnectionPeer {
 
 /// A pool of connections available in a message bus.
 #[derive(Default)]
-struct ConnectionPool {
-    connections: Vec<Connection>,
+struct ConnectionPool<Socket> {
+    connections: Vec<Connection<Socket>>,
 }
 
-impl ConnectionPool {
+impl<S> ConnectionPool<S> {
     /// Create an empty connection pool
     fn new() -> Self {
-        Self::default()
+        ConnectionPool {
+            connections: Vec::new(),
+        }
     }
 
     /// Determine what the next connection identifier must be
@@ -270,7 +268,7 @@ impl ConnectionPool {
     }
 
     /// Adds a new connection to the pool
-    fn add(&mut self, connection: Connection) -> usize {
+    fn add(&mut self, connection: Connection<S>) -> usize {
         let id = self.next_id();
         self.connections.push(connection);
 
@@ -280,17 +278,17 @@ impl ConnectionPool {
     }
 
     /// Get a connection given an identifier
-    fn get(&self, connection_id: usize) -> Option<&Connection> {
+    fn get(&self, connection_id: usize) -> Option<&Connection<S>> {
         self.connections.get(connection_id - 1)
     }
 
     /// Get a mutable reference to a connection given an identifier
-    fn get_mut(&mut self, connection_id: usize) -> Option<&mut Connection> {
+    fn get_mut(&mut self, connection_id: usize) -> Option<&mut Connection<S>> {
         self.connections.get_mut(connection_id - 1)
     }
 
     /// Removes a connection from the pool given its identifier.
-    fn remove(&mut self, connection_id: usize) -> Connection {
+    fn remove(&mut self, connection_id: usize) -> Connection<S> {
         self.connections.remove(connection_id - 1)
     }
 }
@@ -306,14 +304,14 @@ enum ConnectionStatus {
 /// The message bus used by the replicas. The bus is in charge of accepting and
 /// closing connections to the source replica, as well as sending and receiving
 /// messages from other replicas and clients.
-pub(crate) struct ReplicaMessageBus<IO> {
+pub(crate) struct ReplicaMessageBus<IO: crate::io::IO> {
     address: SocketAddr,
 
     /// The socket used to listen for messages.
-    socket: Option<TcpListener>,
+    socket: Option<IO::Local>,
 
     /// The connection pool of the replica bus.
-    connection_pool: ConnectionPool,
+    connection_pool: ConnectionPool<IO::Link>,
 
     /// The current replica's identifier.
     replica: usize,
@@ -339,9 +337,9 @@ pub(crate) struct ReplicaMessageBus<IO> {
     encoding_config: Configuration,
 }
 
-impl<I: IO> ReplicaMessageBus<I> {
+impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
     /// Create a new instance of a message bus for the local replica.
-    pub(crate) fn new(config: &ReplicaConfig, io: I) -> Self {
+    pub(crate) fn new(config: &ReplicaConfig, io: IO) -> Self {
         let current_address = config.addresses.get(config.replica).unwrap();
         let encoding_config = bincode::config::standard();
 
@@ -660,7 +658,7 @@ impl<I: IO> ReplicaMessageBus<I> {
 /// The message bus used by the client. The bus is in charge of accepting and
 /// closing connections to the client, as well as sending and receiving
 /// messages from replicas.
-pub(crate) struct ClientMessageBus<IO> {
+pub(crate) struct ClientMessageBus<IO: crate::io::IO> {
     /// The client's identifier
     client_id: usize,
 
@@ -668,10 +666,10 @@ pub(crate) struct ClientMessageBus<IO> {
     address: SocketAddr,
 
     /// The socket used to listen for messages.
-    socket: Option<TcpListener>,
+    socket: Option<IO::Local>,
 
     /// The connection pool of the replica bus.
-    connection_pool: ConnectionPool,
+    connection_pool: ConnectionPool<IO::Link>,
 
     /// A key-value map identifying each connected replica to the associated
     /// connection identifier.
@@ -690,9 +688,9 @@ pub(crate) struct ClientMessageBus<IO> {
     encoding_config: Configuration,
 }
 
-impl<I: IO> ClientMessageBus<I> {
+impl<IO: crate::io::IO> ClientMessageBus<IO> {
     /// Create a new instance of a message bus for a client.
-    pub(crate) fn new(config: &ClientConfig, io: I) -> Self {
+    pub(crate) fn new(config: &ClientConfig, io: IO) -> Self {
         let encoding_config = bincode::config::standard();
         let mut connections = ConnectionPool::new();
         let mut replicas = HashMap::with_capacity(config.replicas.len() - 1);

@@ -41,7 +41,7 @@ pub(crate) struct ReplicaConfig {
 }
 
 /// A single replica
-pub struct Replica<S, IO> {
+pub struct Replica<S, IO: crate::io::IO> {
     /// The current replica number given the configuration.
     replica_number: usize,
 
@@ -1145,11 +1145,10 @@ mod tests {
     };
 
     use bytes::{Bytes, BytesMut};
-    use mio::net::{TcpListener, TcpStream};
 
     use crate::{
         Operation, ReplicaOptions, encode_operation,
-        io::{AcceptedConnection, IO},
+        io::{AcceptedConnection, IO, SocketLink},
         message::{
             CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
             PrepareMessage, PrepareOkMessage, RecoveryMessage, RecoveryPrimaryResponse,
@@ -1164,10 +1163,21 @@ mod tests {
 
     use super::{Replica, Service, ServiceError};
 
+    struct MockIncomingSocket;
+
+    impl SocketLink for MockIncomingSocket {
+        fn peer_addr(&self) -> Result<SocketAddr, std::io::Error> {
+            unreachable!()
+        }
+    }
+
     struct MockIO;
 
     impl IO for MockIO {
-        fn open_tcp(&self, _: SocketAddr) -> Result<TcpListener, crate::io::IOError> {
+        type Local = ();
+        type Link = MockIncomingSocket;
+
+        fn open_tcp(&self, _: SocketAddr) -> Result<(), crate::io::IOError> {
             unreachable!()
         }
 
@@ -1175,31 +1185,35 @@ mod tests {
             &mut self,
             _: SocketAddr,
             _: usize,
-        ) -> Result<Option<TcpStream>, crate::io::IOError> {
+        ) -> Result<Option<Self::Link>, crate::io::IOError> {
             unreachable!()
         }
 
         fn accept(
             &mut self,
-            _: &TcpListener,
+            _: &(),
             _: usize,
-        ) -> Result<Vec<AcceptedConnection>, crate::io::IOError> {
+        ) -> Result<Vec<AcceptedConnection<Self::Link>>, crate::io::IOError> {
             unreachable!()
         }
 
-        fn close(&self, _: &mut TcpStream) -> Result<(), crate::io::IOError> {
+        fn close(&self, _: &mut Self::Link) -> Result<(), crate::io::IOError> {
             unreachable!()
         }
 
-        fn recv(&self, _: &mut TcpStream, _: &mut BytesMut) -> Result<bool, crate::io::IOError> {
+        fn recv(&self, _: &mut Self::Link, _: &mut BytesMut) -> Result<bool, crate::io::IOError> {
             unreachable!()
         }
 
-        fn write(&self, _: &mut TcpStream, _: &Bytes) -> Result<Option<usize>, crate::io::IOError> {
+        fn write(
+            &self,
+            _: &mut Self::Link,
+            _: &Bytes,
+        ) -> Result<Option<usize>, crate::io::IOError> {
             unreachable!()
         }
 
-        fn send(&self, _: &mut TcpStream, _: usize) -> Result<(), crate::io::IOError> {
+        fn send(&self, _: &mut Self::Link, _: usize) -> Result<(), crate::io::IOError> {
             unreachable!()
         }
 

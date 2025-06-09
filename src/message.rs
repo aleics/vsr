@@ -10,6 +10,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::replica::Log;
 
+pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
 const HEADER_SIZE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
