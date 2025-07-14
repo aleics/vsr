@@ -392,13 +392,13 @@ impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
         for completion in self.io.run(duration)? {
             match completion {
                 Completion::Accept => self.accept()?,
-                Completion::Recv { connection } => {
-                    if let Some(message) = self.recv(connection)? {
+                Completion::Recv { connection_id } => {
+                    if let Some(message) = self.recv(connection_id)? {
                         messages.push(message);
                     }
                 }
-                Completion::Write { connection } => {
-                    self.write(connection)?;
+                Completion::Write { connection_id } => {
+                    self.write(connection_id)?;
                 }
             }
         }
@@ -692,13 +692,13 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
     /// Create a new instance of a message bus for a client.
     pub(crate) fn new(config: &ClientConfig, io: IO) -> Self {
         let encoding_config = bincode::config::standard();
-        let mut connections = ConnectionPool::new();
+        let mut connection_pool = ConnectionPool::new();
         let mut replicas = HashMap::with_capacity(config.replicas.len() - 1);
         let mut connect_attempts = Vec::with_capacity(config.replicas.len());
 
         // Connect to all the known replicas.
         for (replica, address) in config.replicas.iter().enumerate() {
-            let connection_id = connections.add(Connection::new(*address, encoding_config));
+            let connection_id = connection_pool.add(Connection::new(*address, encoding_config));
             replicas.insert(replica, connection_id);
             connect_attempts.push(replica);
         }
@@ -707,7 +707,7 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
             client_id: config.client_id,
             address: config.address,
             socket: None,
-            connection_pool: connections,
+            connection_pool,
             replicas,
             connect_retry: RetryTimeout::new(
                 CONNECT_RETRY_TIMEOUT_ID,
@@ -753,13 +753,13 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
         for completion in self.io.run(duration)? {
             match completion {
                 Completion::Accept => self.accept()?,
-                Completion::Recv { connection } => {
-                    if let Some(message) = self.recv(connection)? {
+                Completion::Recv { connection_id } => {
+                    if let Some(message) = self.recv(connection_id)? {
                         messages.push(message);
                     }
                 }
-                Completion::Write { connection } => {
-                    self.write(connection)?;
+                Completion::Write { connection_id } => {
+                    self.write(connection_id)?;
                 }
             }
         }

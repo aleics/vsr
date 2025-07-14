@@ -13,16 +13,16 @@ const EVENTS_CAPACITY: usize = 128;
 
 /// A completion represents an IO operation that has finished.
 /// Returned by the IO system, it indicates that the operation is ready.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Completion {
     Accept,
-    Recv { connection: usize },
-    Write { connection: usize },
+    Recv { connection_id: usize },
+    Write { connection_id: usize },
 }
 
 pub struct AcceptedConnection<S> {
-    pub(crate) socket: S,
-    pub(crate) connection_id: usize,
+    pub socket: S,
+    pub connection_id: usize,
 }
 
 pub trait SocketLink {
@@ -63,7 +63,7 @@ pub trait IO {
     fn close(&self, socket: &mut Self::Link) -> Result<(), IOError>;
 
     /// Receive a new message in the socket. The result is stored in the buffer provided as a mutable reference.
-    /// A boolean is returned if the connection mus be closed or not.
+    /// A boolean is returned if the connection must be closed or not.
     fn recv(&self, socket: &mut Self::Link, buffer: &mut BytesMut) -> Result<bool, IOError>;
 
     /// Send a new message to the provided socket. This is used as a first step. Once the non-blocking connection
@@ -228,7 +228,7 @@ impl IO for PollIO {
                     // The event notifies that the socket can be read on (incoming messages).
                     if event.is_readable() {
                         completions.push(Completion::Recv {
-                            connection: token.0,
+                            connection_id: token.0,
                         });
                     }
 
@@ -236,7 +236,7 @@ impl IO for PollIO {
                     // events in the connection buffer.
                     if event.is_writable() {
                         completions.push(Completion::Write {
-                            connection: token.0,
+                            connection_id: token.0,
                         });
                     }
                 }
