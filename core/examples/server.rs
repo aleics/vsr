@@ -46,7 +46,7 @@ fn main() {
             current: replica_number,
         };
 
-        let replica = start_replica(&options);
+        let mut replica = start_replica(&options);
 
         handles.push(thread::spawn(move || {
             println!("Replica {replica_number} running...");

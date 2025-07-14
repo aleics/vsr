@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::cell::RefCell;
 use std::thread::{self, sleep};
 use std::time::Duration;
 
@@ -6,9 +6,9 @@ use bincode::{Decode, Encode};
 use vsr::io::PollIO;
 use vsr::{ClientOptions, ReplicaOptions, Service, ServiceError};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Counter {
-    value: Mutex<i32>,
+    value: RefCell<i32>,
 }
 
 impl Service for Counter {
@@ -16,7 +16,7 @@ impl Service for Counter {
     type Output = i32;
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, ServiceError> {
-        let mut current_value = self.value.lock().unwrap();
+        let mut current_value = self.value.borrow_mut();
 
         match input {
             Operation::AddOne => *current_value += 1,
@@ -24,15 +24,6 @@ impl Service for Counter {
         };
 
         Ok(*current_value)
-    }
-}
-
-impl Clone for Counter {
-    fn clone(&self) -> Self {
-        let current_value = self.value.lock().unwrap();
-        Counter {
-            value: Mutex::new(*current_value),
-        }
     }
 }
 
@@ -70,7 +61,7 @@ fn main() {
         let mut replica = vsr::replica(
             &replica_options,
             Counter {
-                value: Mutex::new(1),
+                value: RefCell::new(1),
             },
             io,
         )
@@ -82,7 +73,7 @@ fn main() {
         println!("Replica {} created", i);
     }
 
-    for replica in replicas.into_iter() {
+    for mut replica in replicas.into_iter() {
         handles.push(thread::spawn(move || {
             replica.run().unwrap();
         }));

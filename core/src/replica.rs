@@ -90,6 +90,10 @@ pub struct Replica<S, IO: crate::io::IO> {
     /// Network of the replica containing connections to all the replicas
     /// and the client.
     pub(crate) bus: ReplicaMessageBus<IO>,
+
+    /// A health timeout used to periodically check the health of the replica.
+    /// Meaning, it can communicate with the rest of the replicas.
+    health: Timeout,
 }
 
 impl<S, I, IO, O> Replica<S, IO>
@@ -101,6 +105,7 @@ where
 {
     pub(crate) fn new(config: &ReplicaConfig, service: S, io: IO) -> Self {
         let bus = ReplicaMessageBus::new(config, io);
+        let health = Timeout::new(HEALTH_ID, HEALTH_TICK_COUNT);
 
         Replica {
             replica_number: config.replica,
@@ -117,38 +122,42 @@ where
             client_table: HashMap::default(),
             bus,
             service,
+            health,
         }
     }
 
     pub fn init(&mut self) -> Result<(), ReplicaError> {
         self.bus.init()?;
+        self.health.start();
         Ok(())
     }
 
-    pub fn run(mut self) -> Result<(), ReplicaError> {
-        let mut health = Timeout::new(HEALTH_ID, HEALTH_TICK_COUNT);
-        health.start();
-
+    pub fn run(&mut self) -> Result<(), ReplicaError> {
         loop {
-            if health.fired() {
-                let output = self.periodic()?;
-                health.reset();
+            self.tick()?;
+        }
+    }
 
-                self.handle_output(output)?;
-            }
+    pub fn tick(&mut self) -> Result<(), ReplicaError> {
+        if self.health.fired() {
+            let output = self.periodic()?;
+            self.health.reset();
 
-            let messages = self.bus.tick()?;
-            health.tick();
+            self.handle_output(output)?;
+        }
 
-            for message in messages {
-                if let Err(err) = self
-                    .handle_message(message)
-                    .and_then(|output| self.handle_output(output))
-                {
-                    self.handle_err(&err);
-                }
+        self.health.tick();
+
+        for message in self.bus.tick()? {
+            if let Err(err) = self
+                .handle_message(message)
+                .and_then(|output| self.handle_output(output))
+            {
+                self.handle_err(&err);
             }
         }
+
+        Ok(())
     }
 
     fn handle_output(&mut self, output: HandleOutput) -> Result<(), ReplicaError> {
@@ -283,15 +292,15 @@ where
                 return Ok(HandleOutput::DoNothing);
             }
 
-            if most_recent_request.request_number == request.request_number {
-                if let Some(result) = &most_recent_request.response {
-                    let message = ReplyMessage {
-                        view: request.view,
-                        request_number: most_recent_request.request_number,
-                        result: result.clone(),
-                    };
-                    return Ok(HandleOutput::send_client(message, request.client_id));
-                }
+            if most_recent_request.request_number == request.request_number
+                && let Some(result) = &most_recent_request.response
+            {
+                let message = ReplyMessage {
+                    view: request.view,
+                    request_number: most_recent_request.request_number,
+                    result: result.clone(),
+                };
+                return Ok(HandleOutput::send_client(message, request.client_id));
             }
         }
 
