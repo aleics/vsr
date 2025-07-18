@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
+    fmt::Display,
     net::SocketAddr,
     rc::Rc,
     time::Duration,
@@ -164,7 +165,22 @@ pub(crate) enum FaultyIOProperty {
     Run,
 }
 
-#[derive(Default)]
+impl Display for FaultyIOProperty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FaultyIOProperty::Open => "Open",
+            FaultyIOProperty::Connect => "Connect",
+            FaultyIOProperty::Accept => "Accept",
+            FaultyIOProperty::Close => "Close",
+            FaultyIOProperty::Recv => "Recv",
+            FaultyIOProperty::Send => "Send",
+            FaultyIOProperty::Write => "Write",
+            FaultyIOProperty::Run => "Run",
+        })
+    }
+}
+
+#[derive(Default, Debug)]
 pub(crate) struct FaultyIOProbs {
     open_error: f64,
     connect_error: f64,
@@ -195,6 +211,20 @@ impl FaultyIOProbs {
         }
         probs
     }
+
+    pub(crate) fn new_with_seed(env: &Env) -> Self {
+        let mut probs = Self::new();
+        probs.open_error = env.random_prob(0.0, 0.0);
+        probs.connect_error = env.random_prob(0.0, 0.0);
+        probs.accept_error = env.random_prob(0.0, 0.0);
+        probs.close_error = env.random_prob(0.0, 0.0);
+        probs.recv_error = env.random_prob(0.0, 0.1);
+        probs.send_error = env.random_prob(0.0, 0.1);
+        probs.write_error = env.random_prob(0.0, 0.1);
+        probs.run_error = env.random_prob(0.0, 0.5);
+
+        probs
+    }
 }
 
 pub(crate) struct FaultyIO {
@@ -222,8 +252,8 @@ impl FaultyIO {
     }
 }
 
-fn io_error() -> std::io::Error {
-    std::io::Error::other("Simulated error")
+fn io_error(property: FaultyIOProperty) -> std::io::Error {
+    std::io::Error::other(format!("Simulated error for {property}"))
 }
 
 impl IO for FaultyIO {
@@ -232,7 +262,7 @@ impl IO for FaultyIO {
 
     fn open_tcp(&self, addr: SocketAddr) -> Result<Self::Local, IOError> {
         if self.env.flip_coin(self.probs.open_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Open).into());
         }
 
         *self.address.borrow_mut() = Some(addr);
@@ -249,7 +279,7 @@ impl IO for FaultyIO {
         connection_id: usize,
     ) -> Result<Option<Self::Link>, IOError> {
         if self.env.flip_coin(self.probs.connect_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Connect).into());
         }
 
         let current = self
@@ -275,7 +305,7 @@ impl IO for FaultyIO {
         connection_id: usize,
     ) -> Result<Vec<AcceptedConnection<Self::Link>>, IOError> {
         if local.env.flip_coin(self.probs.accept_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Accept).into());
         }
 
         let current = self
@@ -309,7 +339,7 @@ impl IO for FaultyIO {
 
     fn close(&self, link: &mut Self::Link) -> Result<(), IOError> {
         if link.env.flip_coin(self.probs.close_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Close).into());
         }
 
         let address = self
@@ -338,7 +368,7 @@ impl IO for FaultyIO {
 
     fn recv(&self, link: &mut Self::Link, buffer: &mut BytesMut) -> Result<bool, IOError> {
         if link.env.flip_coin(self.probs.recv_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Recv).into());
         }
 
         let address = self
@@ -358,7 +388,7 @@ impl IO for FaultyIO {
 
     fn send(&self, link: &mut Self::Link, connection_id: usize) -> Result<(), IOError> {
         if link.env.flip_coin(self.probs.send_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Send).into());
         }
 
         let address = self
@@ -374,7 +404,7 @@ impl IO for FaultyIO {
 
     fn write(&self, link: &mut Self::Link, bytes: &Bytes) -> Result<Option<usize>, IOError> {
         if link.env.flip_coin(self.probs.write_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Write).into());
         }
 
         let address = self
@@ -400,7 +430,7 @@ impl IO for FaultyIO {
 
     fn run(&mut self, _: Duration) -> Result<Vec<Completion>, IOError> {
         if self.env.flip_coin(self.probs.run_error) {
-            return Err(io_error().into());
+            return Err(io_error(FaultyIOProperty::Run).into());
         }
 
         let address = self

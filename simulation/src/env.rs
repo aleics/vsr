@@ -22,4 +22,9 @@ impl Env {
         let mut rng = self.rng.borrow_mut();
         rng.random_bool(probability)
     }
+
+    pub(crate) fn random_prob(&self, min: f64, max: f64) -> f64 {
+        let mut rng = self.rng.borrow_mut();
+        rng.random_range(min..=max)
+    }
 }

@@ -89,11 +89,15 @@ fn main() {
     runner.init();
 
     loop {
-        runner.tick_replicas().unwrap();
+        if let Err(err) = runner.tick_replicas() {
+            tracing::error!("Error in replica: {}", err);
+        }
 
         // Give some time to the replicas to connect to each other
         if runner.start_time.elapsed() >= Duration::from_secs(1) {
-            runner.tick_clients().unwrap();
+            if let Err(err) = runner.tick_clients() {
+                tracing::error!("Error in client: {}", err);
+            }
         }
     }
 }

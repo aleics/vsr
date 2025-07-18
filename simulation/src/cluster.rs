@@ -77,7 +77,7 @@ fn create_replicas(
             queue.clone(),
             lookup.clone(),
             env.clone(),
-            FaultyIOProbs::new(),
+            FaultyIOProbs::new_with_seed(&env),
         );
 
         replicas.push(vsr::replica(&options, service, io).unwrap());
@@ -106,7 +106,7 @@ fn create_clients(
             queue.clone(),
             lookup.clone(),
             env.clone(),
-            FaultyIOProbs::new(),
+            FaultyIOProbs::new_with_seed(&env),
         );
 
         clients.push(vsr::client(&options, 0, io).unwrap());
