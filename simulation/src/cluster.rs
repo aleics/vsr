@@ -5,7 +5,7 @@ use crate::{
     io::{ConnectionLookup, SimQueue},
 };
 
-use super::io::FaultyIO;
+use super::io::{FaultyIO, FaultyIOProbs};
 use vsr::{ClientOptions, ReplicaOptions, Service, client::Client, replica::Replica};
 
 const CLUSTER_IP: &str = "127.0.0.1";
@@ -73,7 +73,12 @@ fn create_replicas(
             addresses: addresses.clone(),
         };
         let service = SimService::default();
-        let io = FaultyIO::new(queue.clone(), lookup.clone(), env.clone());
+        let io = FaultyIO::new(
+            queue.clone(),
+            lookup.clone(),
+            env.clone(),
+            FaultyIOProbs::new(),
+        );
 
         replicas.push(vsr::replica(&options, service, io).unwrap());
     }
@@ -97,7 +102,12 @@ fn create_clients(
             client_id: client as usize,
             replicas: replica_addresses.clone(),
         };
-        let io = FaultyIO::new(queue.clone(), lookup.clone(), env.clone());
+        let io = FaultyIO::new(
+            queue.clone(),
+            lookup.clone(),
+            env.clone(),
+            FaultyIOProbs::new(),
+        );
 
         clients.push(vsr::client(&options, 0, io).unwrap());
     }

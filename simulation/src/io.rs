@@ -152,7 +152,20 @@ impl ConnectionLookup {
     }
 }
 
-struct FaultyIOProbs {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FaultyIOProperty {
+    Open,
+    Connect,
+    Accept,
+    Close,
+    Recv,
+    Send,
+    Write,
+    Run,
+}
+
+#[derive(Default)]
+pub(crate) struct FaultyIOProbs {
     open_error: f64,
     connect_error: f64,
     accept_error: f64,
@@ -161,6 +174,27 @@ struct FaultyIOProbs {
     send_error: f64,
     write_error: f64,
     run_error: f64,
+}
+
+impl FaultyIOProbs {
+    pub(crate) fn new() -> Self {
+        FaultyIOProbs::default()
+    }
+
+    pub(crate) fn new_with_fault(property: FaultyIOProperty, probability: f64) -> Self {
+        let mut probs = Self::new();
+        match property {
+            FaultyIOProperty::Open => probs.open_error = probability,
+            FaultyIOProperty::Connect => probs.connect_error = probability,
+            FaultyIOProperty::Accept => probs.accept_error = probability,
+            FaultyIOProperty::Close => probs.close_error = probability,
+            FaultyIOProperty::Recv => probs.recv_error = probability,
+            FaultyIOProperty::Send => probs.send_error = probability,
+            FaultyIOProperty::Write => probs.write_error = probability,
+            FaultyIOProperty::Run => probs.run_error = probability,
+        }
+        probs
+    }
 }
 
 pub(crate) struct FaultyIO {
@@ -172,21 +206,16 @@ pub(crate) struct FaultyIO {
 }
 
 impl FaultyIO {
-    pub(crate) fn new(queue: SimQueue, lookup: ConnectionLookup, env: Env) -> Self {
+    pub(crate) fn new(
+        queue: SimQueue,
+        lookup: ConnectionLookup,
+        env: Env,
+        probs: FaultyIOProbs,
+    ) -> Self {
         FaultyIO {
             env,
             address: RefCell::new(None),
-            // TODO: generate faulty probabilities from seed
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 0.0,
-                accept_error: 0.0,
-                close_error: 0.0,
-                recv_error: 0.0,
-                send_error: 0.0,
-                write_error: 0.0,
-                run_error: 0.0,
-            },
+            probs,
             connected: lookup,
             queue,
         }
@@ -388,7 +417,6 @@ impl IO for FaultyIO {
 mod tests {
 
     use std::{
-        cell::RefCell,
         collections::{HashMap, HashSet},
         net::SocketAddr,
         time::Duration,
@@ -400,8 +428,8 @@ mod tests {
     use crate::{
         env::Env,
         io::{
-            ConnectionLookup, FaultyIO, FaultyIOProbs, FaultySocketLink, FaultySocketLocal,
-            SimMessage, SimQueue,
+            ConnectionLookup, FaultyIO, FaultyIOProbs, FaultyIOProperty, FaultySocketLink,
+            FaultySocketLocal, SimMessage, SimQueue,
         },
     };
 
@@ -413,7 +441,16 @@ mod tests {
         let env = env();
         let queue = SimQueue::new();
         let lookup = ConnectionLookup::new();
-        FaultyIO::new(queue, lookup, env)
+        let probs = FaultyIOProbs::new();
+        FaultyIO::new(queue, lookup, env, probs)
+    }
+
+    fn faulty_io_with_fault(fault_type: FaultyIOProperty, probability: f64) -> FaultyIO {
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let probs = FaultyIOProbs::new_with_fault(fault_type, probability);
+        FaultyIO::new(queue, lookup, env, probs)
     }
 
     #[test]
@@ -891,26 +928,8 @@ mod tests {
 
     #[test]
     fn test_faulty_io_with_fault_injection() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(None),
-            probs: FaultyIOProbs {
-                open_error: 1.0, // Always fail
-                connect_error: 0.0,
-                accept_error: 0.0,
-                close_error: 0.0,
-                recv_error: 0.0,
-                send_error: 0.0,
-                write_error: 0.0,
-                run_error: 0.0,
-            },
-            connected: lookup,
-            queue,
-        };
+        // Create a FaultyIO with custom fault probabilities
+        let io = faulty_io_with_fault(FaultyIOProperty::Open, 1.0); // Always fail
 
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
@@ -923,26 +942,8 @@ mod tests {
 
     #[test]
     fn test_faulty_io_connect_error() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let mut io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 1.0, // Always fail
-                accept_error: 0.0,
-                close_error: 0.0,
-                recv_error: 0.0,
-                send_error: 0.0,
-                write_error: 0.0,
-                run_error: 0.0,
-            },
-            connected: lookup,
-            queue,
-        };
+        let mut io = faulty_io_with_fault(FaultyIOProperty::Connect, 1.0); // Always fail
+        *io.address.borrow_mut() = Some("127.0.0.1:8080".parse().unwrap());
 
         let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
@@ -955,29 +956,11 @@ mod tests {
 
     #[test]
     fn test_faulty_io_accept_error() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let mut io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 0.0,
-                accept_error: 1.0, // Always fail
-                close_error: 0.0,
-                recv_error: 0.0,
-                send_error: 0.0,
-                write_error: 0.0,
-                run_error: 0.0,
-            },
-            connected: lookup,
-            queue,
-        };
+        let mut io = faulty_io_with_fault(FaultyIOProperty::Accept, 1.0); // Always fail
+        *io.address.borrow_mut() = Some("127.0.0.1:8080".parse().unwrap());
 
         let local = FaultySocketLocal {
-            env: env.clone(),
+            env: env(),
             addr: "127.0.0.1:8080".parse().unwrap(),
         };
 
@@ -990,35 +973,16 @@ mod tests {
 
     #[test]
     fn test_faulty_io_recv_error() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 0.0,
-                accept_error: 0.0,
-                close_error: 0.0,
-                recv_error: 1.0, // Always fail
-                send_error: 0.0,
-                write_error: 0.0,
-                run_error: 0.0,
-            },
-            connected: lookup,
-            queue,
-        };
+        let io = faulty_io_with_fault(FaultyIOProperty::Recv, 1.0); // Always fail
+        *io.address.borrow_mut() = Some("127.0.0.1:8080".parse().unwrap());
 
         let mut link = FaultySocketLink {
-            env: env.clone(),
+            env: env(),
             addr: "127.0.0.1:8081".parse().unwrap(),
         };
 
-        let mut buffer = BytesMut::new();
-
         // when
+        let mut buffer = BytesMut::new();
         let result = io.recv(&mut link, &mut buffer);
 
         // then
@@ -1027,29 +991,11 @@ mod tests {
 
     #[test]
     fn test_faulty_io_send_error() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 0.0,
-                accept_error: 0.0,
-                close_error: 0.0,
-                recv_error: 0.0,
-                send_error: 1.0, // Always fail
-                write_error: 0.0,
-                run_error: 0.0,
-            },
-            connected: lookup,
-            queue,
-        };
+        let io = faulty_io_with_fault(FaultyIOProperty::Send, 1.0); // Always fail
+        *io.address.borrow_mut() = Some("127.0.0.1:8080".parse().unwrap());
 
         let mut link = FaultySocketLink {
-            env: env.clone(),
+            env: env(),
             addr: "127.0.0.1:8081".parse().unwrap(),
         };
 
@@ -1062,35 +1008,16 @@ mod tests {
 
     #[test]
     fn test_faulty_io_write_error() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 0.0,
-                accept_error: 0.0,
-                close_error: 0.0,
-                recv_error: 0.0,
-                send_error: 0.0,
-                write_error: 1.0, // Always fail
-                run_error: 0.0,
-            },
-            connected: lookup,
-            queue,
-        };
+        let io = faulty_io_with_fault(FaultyIOProperty::Write, 1.0); // Always fail
+        *io.address.borrow_mut() = Some("127.0.0.1:8080".parse().unwrap());
 
         let mut link = FaultySocketLink {
-            env: env.clone(),
+            env: env(),
             addr: "127.0.0.1:8081".parse().unwrap(),
         };
 
-        let bytes = Bytes::from("test");
-
         // when
+        let bytes = Bytes::from("test");
         let result = io.write(&mut link, &bytes);
 
         // then
@@ -1099,26 +1026,8 @@ mod tests {
 
     #[test]
     fn test_faulty_io_run_error() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let mut io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 0.0,
-                accept_error: 0.0,
-                close_error: 0.0,
-                recv_error: 0.0,
-                send_error: 0.0,
-                write_error: 0.0,
-                run_error: 1.0, // Always fail
-            },
-            connected: lookup,
-            queue,
-        };
+        let mut io = faulty_io_with_fault(FaultyIOProperty::Run, 1.0); // Always fail
+        *io.address.borrow_mut() = Some("127.0.0.1:8080".parse().unwrap());
 
         // when
         let result = io.run(Duration::from_millis(100));
@@ -1129,29 +1038,11 @@ mod tests {
 
     #[test]
     fn test_faulty_io_close_error() {
-        // given
-        let env = env();
-        let queue = SimQueue::new();
-        let lookup = ConnectionLookup::new();
-        let io = FaultyIO {
-            env: env.clone(),
-            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
-            probs: FaultyIOProbs {
-                open_error: 0.0,
-                connect_error: 0.0,
-                accept_error: 0.0,
-                close_error: 1.0, // Always fail
-                recv_error: 0.0,
-                send_error: 0.0,
-                write_error: 0.0,
-                run_error: 0.0,
-            },
-            connected: lookup,
-            queue,
-        };
+        let io = faulty_io_with_fault(FaultyIOProperty::Close, 1.0); // Always fail
+        *io.address.borrow_mut() = Some("127.0.0.1:8080".parse().unwrap());
 
         let mut link = FaultySocketLink {
-            env: env.clone(),
+            env: env(),
             addr: "127.0.0.1:8081".parse().unwrap(),
         };
 
