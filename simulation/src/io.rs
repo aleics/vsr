@@ -27,9 +27,15 @@ impl SocketLink for FaultySocketLink {
     }
 }
 
+#[derive(Debug)]
+enum SimMessage {
+    Message(Bytes),
+    Close,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SimQueue {
-    messages: Rc<DashMap<SocketAddr, VecDeque<Bytes>>>,
+    messages: Rc<DashMap<SocketAddr, VecDeque<SimMessage>>>,
 }
 
 impl SimQueue {
@@ -39,17 +45,17 @@ impl SimQueue {
         }
     }
 
-    fn push(&self, address: SocketAddr, message: Bytes) {
+    fn push(&self, address: SocketAddr, message: SimMessage) {
         let mut messages = self.messages.entry(address).or_default();
         messages.push_back(message);
     }
 
-    fn pop(&self, address: &SocketAddr) -> Option<Bytes> {
+    fn pop(&self, address: &SocketAddr) -> Option<SimMessage> {
         let mut messages = self.messages.get_mut(address)?;
         messages.pop_front()
     }
 
-    fn empty(&self, address: &SocketAddr) -> Vec<Bytes> {
+    fn empty(&self, address: &SocketAddr) -> Vec<SimMessage> {
         let Some(mut messages) = self.messages.get_mut(address) else {
             return Vec::new();
         };
@@ -277,7 +283,7 @@ impl IO for FaultyIO {
             return Err(io_error().into());
         }
 
-        let current = self
+        let address = self
             .address
             .borrow()
             .expect("IO needs to be initialized to accept messages");
@@ -285,7 +291,18 @@ impl IO for FaultyIO {
         let target = link.peer_addr()?;
 
         self.queue.empty(&target);
-        self.connected.remove_connection(current, target);
+        self.connected.remove_connection(address, target);
+
+        // Send a close connection message to the peer connection
+        let connection_id = self
+            .connected
+            .get_connection_id(target, address)
+            .expect("Writing to a connection with an unknown connection ID");
+
+        let message = SimMessage::Close;
+        self.queue.push(target, message);
+        self.connected
+            .push_completion(target, Completion::Recv { connection_id });
 
         Ok(())
     }
@@ -301,7 +318,10 @@ impl IO for FaultyIO {
             .expect("IO needs to be initialized to receive messages");
 
         if let Some(message) = self.queue.pop(&address) {
-            buffer.put(message);
+            match message {
+                SimMessage::Message(bytes) => buffer.put(bytes),
+                SimMessage::Close => return Ok(true),
+            };
         }
 
         Ok(false)
@@ -341,7 +361,8 @@ impl IO for FaultyIO {
             .get_connection_id(target, address)
             .expect("Writing to a connection with an unknown connection ID");
 
-        self.queue.push(target, bytes.clone());
+        let message = SimMessage::Message(bytes.clone());
+        self.queue.push(target, message);
         self.connected
             .push_completion(target, Completion::Recv { connection_id });
 
@@ -372,6 +393,7 @@ mod tests {
     };
 
     use crate::io::ConnectionLookup;
+
     #[test]
     fn gets_orphan_lookup() {
         // given

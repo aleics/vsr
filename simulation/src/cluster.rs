@@ -27,6 +27,7 @@ impl Cluster {
         let replica_addresses = generate_addresses(REPLICA_BASE_PORT, &options);
         let queue = SimQueue::new();
         let lookup = ConnectionLookup::new();
+
         let replicas = create_replicas(
             env.clone(),
             replica_addresses.clone(),
