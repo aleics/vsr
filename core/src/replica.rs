@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_request() {
+    fn test_handle_request() {
         // given
         let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
@@ -1354,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_request_returns_most_recent_response() {
+    fn test_handle_request_returns_most_recent_response() {
         // given
         let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
@@ -1390,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_request_backup_replica_ignores() {
+    fn test_handle_request_backup_replica_ignores() {
         // given
         let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
@@ -1409,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_request_invalid_view_sent_by_client() {
+    fn test_handle_request_invalid_view_sent_by_client() {
         // given
         let operation = usize_as_bytes(0);
         let request = Message::Request(RequestMessage {
@@ -1428,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_prepare() {
+    fn test_handle_prepare() {
         // given
         let operation = usize_as_bytes(0);
         let prepare = Message::Prepare(PrepareMessage {
@@ -1483,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_prepare_triggers_state_transfer() {
+    fn test_handle_prepare_triggers_state_transfer() {
         // given
         let operation = usize_as_bytes(1);
         let prepare = Message::Prepare(PrepareMessage {
@@ -1518,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_prepare_ok() {
+    fn test_handle_prepare_ok() {
         // given
         let prepare_ok = Message::PrepareOk(PrepareOkMessage {
             view: 0,
@@ -1579,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_prepare_ok_waits_for_quorum() {
+    fn test_handle_prepare_ok_waits_for_quorum() {
         // given
         let prepare_ok = Message::PrepareOk(PrepareOkMessage {
             view: 0,
@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_commit() {
+    fn test_handle_commit() {
         // given
         let mut replica = MockReplicaBuilder::new().backup().build();
         let commit = Message::Commit(CommitMessage {
@@ -1649,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_commit_trigger_state_transfer() {
+    fn test_handle_commit_trigger_state_transfer() {
         // given
         let mut replica = MockReplicaBuilder::new().backup().build();
         let commit = Message::Commit(CommitMessage {
@@ -1681,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_get_state() {
+    fn test_handle_get_state() {
         // given
         let get_state = Message::GetState(GetStateMessage {
             view: 0,
@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_new_state() {
+    fn test_handle_new_state() {
         // given
         let new_state = Message::NewState(NewStateMessage {
             view: 0,
@@ -1813,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_start_view_change() {
+    fn test_handle_start_view_change() {
         // given
         let start_view_change = Message::StartViewChange(StartViewChangeMessage {
             new_view: 1,
@@ -1854,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_start_view_change_new_primary_acknowledges() {
+    fn test_handle_start_view_change_new_primary_acknowledges() {
         // given
         let start_view_change = Message::StartViewChange(StartViewChangeMessage {
             new_view: 1,
@@ -1895,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_do_view_change() {
+    fn test_handle_do_view_change() {
         // given
         let mut message_log = Log::new();
         message_log.append(usize_as_bytes(0), 1, 1);
@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_do_view_change_waits_for_quorum() {
+    fn test_handle_do_view_change_waits_for_quorum() {
         // given
         let mut message_log = Log::new();
         message_log.append(usize_as_bytes(0), 1, 1);
@@ -2013,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_start_view() {
+    fn test_handle_start_view() {
         // given
         let mut message_log = Log::new();
         message_log.append(usize_as_bytes(0), 1, 1);
@@ -2068,7 +2068,7 @@ mod tests {
     }
 
     #[test]
-    fn triggers_recovery() {
+    fn test_trigger_recovery() {
         // given
         let mut replica = MockReplicaBuilder::new().backup().build();
 
@@ -2131,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_recovery_backup_replica() {
+    fn test_handle_recovery_backup_replica() {
         // given
         let recovery = Message::Recovery(RecoveryMessage {
             replica_number: 1,
@@ -2163,7 +2163,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_recovery_response() {
+    fn test_handle_recovery_response() {
         // given
         let mut log = Log::new();
         log.append(usize_as_bytes(0), 1, 1);
@@ -2226,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_recovery_response_waits_for_quorum() {
+    fn test_handle_recovery_response_waits_for_quorum() {
         // given
         let mut log = Log::new();
         log.append(usize_as_bytes(0), 1, 1);
@@ -2268,7 +2268,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_recovery_response_waits_for_primary_ack() {
+    fn test_handle_recovery_response_waits_for_primary_ack() {
         // given
         let mut log = Log::new();
         log.append(usize_as_bytes(0), 1, 1);

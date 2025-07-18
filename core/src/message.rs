@@ -218,7 +218,7 @@ mod tests {
     };
 
     #[test]
-    fn encodes_decodes_single_message() {
+    fn test_encode_decode_single_message() {
         // given
         let message = Message::Request(RequestMessage {
             view: 0,

@@ -70,7 +70,7 @@ fn main() {
         replica.init().unwrap();
         replicas.push(replica);
 
-        println!("Replica {} created", i);
+        println!("Replica {i} created");
     }
 
     for mut replica in replicas.into_iter() {
@@ -88,7 +88,7 @@ fn main() {
     while !client.is_ready() {
         let responses = client.tick::<i32>().unwrap();
         if !responses.is_empty() {
-            println!("Received responses while getting ready: {:?}", responses);
+            println!("Received responses while getting ready: {responses:?}");
         }
     }
 
@@ -99,7 +99,7 @@ fn main() {
     loop {
         let responses = client.tick::<i32>().unwrap();
         if !responses.is_empty() {
-            println!("Received responses: {:?}", responses);
+            println!("Received responses: {responses:?}");
             break;
         }
     }
@@ -110,7 +110,7 @@ fn main() {
     loop {
         let responses = client.tick::<i32>().unwrap();
         if !responses.is_empty() {
-            println!("Received responses: {:?}", responses);
+            println!("Received responses: {responses:?}");
             break;
         }
     }
@@ -124,7 +124,7 @@ fn main() {
     loop {
         let responses = client.tick::<i32>().unwrap();
         if !responses.is_empty() {
-            println!("Received responses: {:?}", responses);
+            println!("Received responses: {responses:?}");
             break;
         }
     }
@@ -139,7 +139,7 @@ fn main() {
     loop {
         let responses = client.tick::<i32>().unwrap();
         if !responses.is_empty() {
-            println!("Received responses: {:?}", responses);
+            println!("Received responses: {responses:?}");
             break;
         }
     }

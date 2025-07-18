@@ -21,7 +21,7 @@ impl Service for EchoService {
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, vsr::ServiceError> {
         println!("message received {input}");
-        Ok(format!("echo \"{}\"", input))
+        Ok(format!("echo \"{input}\""))
     }
 }
 

@@ -45,7 +45,7 @@ fn main() {
     };
 
     let mut client = start_client(&options);
-    println!("Starting client (id: {})...", client_id);
+    println!("Starting client (id: {client_id})...");
 
     while !client.is_ready() {
         client.tick::<i32>().unwrap();
@@ -65,7 +65,7 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from stdin: {}", e);
+                    eprintln!("Error reading from stdin: {e}");
                     break;
                 }
             }

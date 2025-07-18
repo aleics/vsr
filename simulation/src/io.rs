@@ -388,14 +388,449 @@ impl IO for FaultyIO {
 mod tests {
 
     use std::{
+        cell::RefCell,
         collections::{HashMap, HashSet},
         net::SocketAddr,
+        time::Duration,
     };
 
-    use crate::io::ConnectionLookup;
+    use bytes::{Bytes, BytesMut};
+    use vsr::io::{Completion, IO, SocketLink};
+
+    use crate::{
+        env::Env,
+        io::{
+            ConnectionLookup, FaultyIO, FaultyIOProbs, FaultySocketLink, FaultySocketLocal,
+            SimMessage, SimQueue,
+        },
+    };
+
+    fn env() -> Env {
+        Env::new(42)
+    }
+
+    fn faulty_io() -> FaultyIO {
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        FaultyIO::new(queue, lookup, env)
+    }
 
     #[test]
-    fn gets_orphan_lookup() {
+    fn test_open_tcp_success() {
+        // given
+        let io = faulty_io();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // when
+        let result = io.open_tcp(addr);
+
+        // then
+        assert!(result.is_ok());
+
+        let local = result.unwrap();
+        assert_eq!(local.addr, addr);
+        assert_eq!(*io.address.borrow(), Some(addr));
+    }
+
+    #[test]
+    fn test_connect_success() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let _ = io.open_tcp(local_addr).unwrap();
+
+        // when
+        let result = io.connect(remote_addr, 1);
+
+        // then
+        assert!(result.is_ok());
+
+        let link = result.unwrap();
+        assert!(link.is_some());
+        assert_eq!(link.unwrap().addr, remote_addr);
+    }
+
+    #[test]
+    fn test_accept_success() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        // Set up the scenario: remote connects to local
+        let local = io.open_tcp(local_addr).unwrap();
+
+        // Simulate remote connection
+        io.connected.insert_connection(remote_addr, local_addr, 1);
+
+        // when
+        let result = io.accept(&local, 2);
+        assert!(result.is_ok());
+
+        // then
+        let accepted = result.unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].socket.addr, remote_addr);
+        assert_eq!(accepted[0].connection_id, 2);
+    }
+
+    #[test]
+    fn test_accept_multiple_connections() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr1: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let remote_addr2: SocketAddr = "127.0.0.1:8082".parse().unwrap();
+
+        let local = io.open_tcp(local_addr).unwrap();
+
+        // Simulate multiple remote connections
+        io.connected.insert_connection(remote_addr1, local_addr, 1);
+        io.connected.insert_connection(remote_addr2, local_addr, 2);
+
+        // when
+        let result = io.accept(&local, 3);
+        assert!(result.is_ok());
+
+        // then
+        let accepted = result.unwrap();
+        assert_eq!(accepted.len(), 2);
+
+        // Check that connection IDs are sequential
+        let mut connection_ids: Vec<_> = accepted.iter().map(|a| a.connection_id).collect();
+        connection_ids.sort();
+        assert_eq!(connection_ids, vec![3, 4]);
+    }
+
+    #[test]
+    fn test_close_success() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        // Set up a connection
+        let _local = io.open_tcp(local_addr).unwrap();
+        let mut link = io.connect(remote_addr, 1).unwrap().unwrap();
+
+        // Establish bidirectional connection
+        io.connected.insert_connection(remote_addr, local_addr, 2);
+
+        // Verify connection exists before closing
+        assert_eq!(
+            io.connected.get_connection_id(local_addr, remote_addr),
+            Some(1)
+        );
+        assert_eq!(
+            io.connected.get_connection_id(remote_addr, local_addr),
+            Some(2)
+        );
+
+        // when
+        let result = io.close(&mut link);
+
+        // then
+        assert!(result.is_ok());
+
+        // Verify the connection from local to remote has been removed
+        assert_eq!(
+            io.connected.get_connection_id(local_addr, remote_addr),
+            None
+        );
+
+        // Verify the reverse connection still exists (only one direction is removed)
+        assert_eq!(
+            io.connected.get_connection_id(remote_addr, local_addr),
+            Some(2)
+        );
+
+        // Verify a close message was sent to the peer
+        let message = io.queue.pop(&remote_addr);
+        assert!(matches!(message, Some(SimMessage::Close)));
+
+        // Verify a recv completion was queued for the remote peer
+        let completions = io.connected.drain_completions(remote_addr);
+        assert!(!completions.is_empty());
+        // Check that at least one completion is a Recv with connection_id 2
+        let recv_completion = completions
+            .iter()
+            .find(|c| matches!(c, Completion::Recv { connection_id: 2 }));
+        assert!(
+            recv_completion.is_some(),
+            "Expected Recv completion with connection_id 2"
+        );
+    }
+
+    #[test]
+    fn test_recv_with_message() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        // Set up connection and queue message
+        let _local = io.open_tcp(local_addr).unwrap();
+        let mut link = io.connect(remote_addr, 1).unwrap().unwrap();
+
+        let test_message = Bytes::from("test message");
+        io.queue
+            .push(local_addr, SimMessage::Message(test_message.clone()));
+
+        let mut buffer = BytesMut::new();
+
+        // when
+        let result = io.recv(&mut link, &mut buffer);
+
+        // then
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Should not close connection
+        assert_eq!(buffer.as_ref(), test_message.as_ref());
+    }
+
+    #[test]
+    fn test_recv_with_close_message() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let _local = io.open_tcp(local_addr).unwrap();
+        let mut link = io.connect(remote_addr, 1).unwrap().unwrap();
+
+        io.queue.push(local_addr, SimMessage::Close);
+
+        let mut buffer = BytesMut::new();
+
+        // when
+        let result = io.recv(&mut link, &mut buffer);
+
+        // then
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // Should close connection
+    }
+
+    #[test]
+    fn test_recv_empty_queue() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let _local = io.open_tcp(local_addr).unwrap();
+        let mut link = io.connect(remote_addr, 1).unwrap().unwrap();
+
+        let mut buffer = BytesMut::new();
+
+        // when
+        let result = io.recv(&mut link, &mut buffer);
+
+        // then
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Should not close connection
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_send_success() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let _local = io.open_tcp(local_addr).unwrap();
+        let mut link = io.connect(remote_addr, 1).unwrap().unwrap();
+
+        // when
+        let result = io.send(&mut link, 1);
+
+        // then
+        assert!(result.is_ok());
+
+        // Check that a write completion was queued
+        let completions = io.connected.drain_completions(local_addr);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0], Completion::Write { connection_id: 1 });
+    }
+
+    #[test]
+    fn test_write_success() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let _local = io.open_tcp(local_addr).unwrap();
+        let mut link = io.connect(remote_addr, 1).unwrap().unwrap();
+
+        // Set up bidirectional connection
+        io.connected.insert_connection(remote_addr, local_addr, 2);
+
+        let test_data = Bytes::from("test data");
+
+        // when
+        let result = io.write(&mut link, &test_data);
+
+        // then
+        assert!(result.is_ok());
+        let written = result.unwrap();
+        assert_eq!(written, Some(test_data.len()));
+
+        // Check that message was queued for remote
+        let message = io.queue.pop(&remote_addr);
+        assert!(message.is_some());
+
+        // Check that recv completion was queued for remote
+        let completions = io.connected.drain_completions(remote_addr);
+
+        // The first completion is Accept from connect(), the second is Recv from write()
+        assert_eq!(completions[0], Completion::Accept);
+        assert_eq!(completions[1], Completion::Recv { connection_id: 2 });
+    }
+
+    #[test]
+    fn test_run_success() {
+        // given
+        let mut io = faulty_io();
+        let local_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        let _local = io.open_tcp(local_addr).unwrap();
+
+        // Queue some completions
+        io.connected.push_completion(local_addr, Completion::Accept);
+        io.connected
+            .push_completion(local_addr, Completion::Recv { connection_id: 1 });
+
+        // when
+        let result = io.run(Duration::from_millis(100));
+
+        // then
+        assert!(result.is_ok());
+
+        let completions = result.unwrap();
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0], Completion::Accept);
+        assert_eq!(completions[1], Completion::Recv { connection_id: 1 });
+
+        // Check that completions were drained
+        let remaining = io.connected.drain_completions(local_addr);
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_socket_link_peer_addr() {
+        // given
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let env = env();
+        let link = FaultySocketLink { env, addr };
+
+        // when
+        let result = link.peer_addr();
+
+        // then
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), addr);
+    }
+
+    #[test]
+    #[should_panic(expected = "IO needs to be initialized")]
+    fn test_io_without_initialization() {
+        // given
+        let mut io = faulty_io();
+        let remote_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        // expect
+        let _result = io.connect(remote_addr, 1);
+    }
+
+    #[test]
+    fn test_sim_queue_operations() {
+        // given
+        let queue = SimQueue::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Test push and pop
+        let message1 = SimMessage::Message(Bytes::from("msg1"));
+        let message2 = SimMessage::Close;
+
+        queue.push(addr, message1);
+        queue.push(addr, message2);
+
+        // expect
+        let popped1 = queue.pop(&addr);
+        assert!(popped1.is_some());
+
+        let popped2 = queue.pop(&addr);
+        assert!(popped2.is_some());
+
+        let popped3 = queue.pop(&addr);
+        assert!(popped3.is_none());
+    }
+
+    #[test]
+    fn test_sim_queue_empty() {
+        // given
+        let queue = SimQueue::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        let message1 = SimMessage::Message(Bytes::from("msg1"));
+        let message2 = SimMessage::Close;
+
+        queue.push(addr, message1);
+        queue.push(addr, message2);
+
+        // when
+        let all_messages = queue.empty(&addr);
+
+        // then
+        assert_eq!(all_messages.len(), 2);
+
+        // Queue should be empty now
+        let popped = queue.pop(&addr);
+        assert!(popped.is_none());
+    }
+
+    #[test]
+    fn test_connection_lookup_completions() {
+        // given
+        let lookup = ConnectionLookup::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        lookup.push_completion(addr, Completion::Accept);
+        lookup.push_completion(addr, Completion::Recv { connection_id: 1 });
+
+        // when
+        let completions = lookup.drain_completions(addr);
+
+        // then
+        assert_eq!(completions.len(), 2);
+
+        // Should be empty after drain
+        let remaining = lookup.drain_completions(addr);
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_connection_lookup_get_connection_id() {
+        // given
+        let lookup = ConnectionLookup::new();
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        lookup.insert_connection(addr1, addr2, 42);
+
+        // expect
+        let connection_id = lookup.get_connection_id(addr1, addr2);
+        assert_eq!(connection_id, Some(42));
+
+        let no_connection = lookup.get_connection_id(addr2, addr1);
+        assert_eq!(no_connection, None);
+    }
+
+    #[test]
+    fn test_get_orphan_lookup() {
         // given
         let replica_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         let replica_b: SocketAddr = "127.0.0.1:3001".parse().unwrap();
@@ -455,7 +890,280 @@ mod tests {
     }
 
     #[test]
-    fn remove_connection() {
+    fn test_faulty_io_with_fault_injection() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(None),
+            probs: FaultyIOProbs {
+                open_error: 1.0, // Always fail
+                connect_error: 0.0,
+                accept_error: 0.0,
+                close_error: 0.0,
+                recv_error: 0.0,
+                send_error: 0.0,
+                write_error: 0.0,
+                run_error: 0.0,
+            },
+            connected: lookup,
+            queue,
+        };
+
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // when
+        let result = io.open_tcp(addr);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_faulty_io_connect_error() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let mut io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
+            probs: FaultyIOProbs {
+                open_error: 0.0,
+                connect_error: 1.0, // Always fail
+                accept_error: 0.0,
+                close_error: 0.0,
+                recv_error: 0.0,
+                send_error: 0.0,
+                write_error: 0.0,
+                run_error: 0.0,
+            },
+            connected: lookup,
+            queue,
+        };
+
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        // when
+        let result = io.connect(addr, 1);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_faulty_io_accept_error() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let mut io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
+            probs: FaultyIOProbs {
+                open_error: 0.0,
+                connect_error: 0.0,
+                accept_error: 1.0, // Always fail
+                close_error: 0.0,
+                recv_error: 0.0,
+                send_error: 0.0,
+                write_error: 0.0,
+                run_error: 0.0,
+            },
+            connected: lookup,
+            queue,
+        };
+
+        let local = FaultySocketLocal {
+            env: env.clone(),
+            addr: "127.0.0.1:8080".parse().unwrap(),
+        };
+
+        // when
+        let result = io.accept(&local, 1);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_faulty_io_recv_error() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
+            probs: FaultyIOProbs {
+                open_error: 0.0,
+                connect_error: 0.0,
+                accept_error: 0.0,
+                close_error: 0.0,
+                recv_error: 1.0, // Always fail
+                send_error: 0.0,
+                write_error: 0.0,
+                run_error: 0.0,
+            },
+            connected: lookup,
+            queue,
+        };
+
+        let mut link = FaultySocketLink {
+            env: env.clone(),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+        };
+
+        let mut buffer = BytesMut::new();
+
+        // when
+        let result = io.recv(&mut link, &mut buffer);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_faulty_io_send_error() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
+            probs: FaultyIOProbs {
+                open_error: 0.0,
+                connect_error: 0.0,
+                accept_error: 0.0,
+                close_error: 0.0,
+                recv_error: 0.0,
+                send_error: 1.0, // Always fail
+                write_error: 0.0,
+                run_error: 0.0,
+            },
+            connected: lookup,
+            queue,
+        };
+
+        let mut link = FaultySocketLink {
+            env: env.clone(),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+        };
+
+        // when
+        let result = io.send(&mut link, 1);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_faulty_io_write_error() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
+            probs: FaultyIOProbs {
+                open_error: 0.0,
+                connect_error: 0.0,
+                accept_error: 0.0,
+                close_error: 0.0,
+                recv_error: 0.0,
+                send_error: 0.0,
+                write_error: 1.0, // Always fail
+                run_error: 0.0,
+            },
+            connected: lookup,
+            queue,
+        };
+
+        let mut link = FaultySocketLink {
+            env: env.clone(),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+        };
+
+        let bytes = Bytes::from("test");
+
+        // when
+        let result = io.write(&mut link, &bytes);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_faulty_io_run_error() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let mut io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
+            probs: FaultyIOProbs {
+                open_error: 0.0,
+                connect_error: 0.0,
+                accept_error: 0.0,
+                close_error: 0.0,
+                recv_error: 0.0,
+                send_error: 0.0,
+                write_error: 0.0,
+                run_error: 1.0, // Always fail
+            },
+            connected: lookup,
+            queue,
+        };
+
+        // when
+        let result = io.run(Duration::from_millis(100));
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_faulty_io_close_error() {
+        // given
+        let env = env();
+        let queue = SimQueue::new();
+        let lookup = ConnectionLookup::new();
+        let io = FaultyIO {
+            env: env.clone(),
+            address: RefCell::new(Some("127.0.0.1:8080".parse().unwrap())),
+            probs: FaultyIOProbs {
+                open_error: 0.0,
+                connect_error: 0.0,
+                accept_error: 0.0,
+                close_error: 1.0, // Always fail
+                recv_error: 0.0,
+                send_error: 0.0,
+                write_error: 0.0,
+                run_error: 0.0,
+            },
+            connected: lookup,
+            queue,
+        };
+
+        let mut link = FaultySocketLink {
+            env: env.clone(),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+        };
+
+        // when
+        let result = io.close(&mut link);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_connection() {
         // given
         let connection_lookup = ConnectionLookup::new();
         let replica_a = "127.0.0.1:3000".parse().unwrap();
@@ -495,7 +1203,7 @@ mod tests {
                 .connection_ids
                 .iter()
                 .fold(HashMap::new(), |mut acc, connection| {
-                    acc.insert(*connection.key(), connection.value().clone());
+                    acc.insert(*connection.key(), *connection.value());
                     acc
                 }),
             connection_ids
