@@ -4,7 +4,7 @@ use bincode::{Decode, Encode};
 use thiserror::Error;
 
 use crate::{
-    ClientOptions, InputError, ReplicaId,
+    ClientId, ClientOptions, InputError, ReplicaId,
     bus::ClientMessageBus,
     decode_operation, encode_operation,
     io::IOError,
@@ -14,7 +14,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientConfig {
     pub seed: u64,
-    pub client_id: usize,
+    pub client_id: ClientId,
     pub address: SocketAddr,
     pub replicas: Vec<SocketAddr>,
 }

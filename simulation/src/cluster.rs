@@ -14,7 +14,7 @@ const CLIENT_BASE_PORT: u32 = 8000;
 
 pub(crate) struct ClusterOptions {
     pub(crate) replica_count: ReplicaId,
-    pub(crate) client_count: ReplicaId,
+    pub(crate) client_count: usize,
 }
 
 pub(crate) struct Cluster {
@@ -99,7 +99,7 @@ fn create_clients(
         let options = ClientOptions {
             seed: env.seed,
             address: generate_address(CLIENT_BASE_PORT + client as u32),
-            client_id: client as usize,
+            client_id: client as u128,
             replicas: replica_addresses.clone(),
         };
         let io = FaultyIO::new(

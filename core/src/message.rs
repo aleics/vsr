@@ -8,7 +8,7 @@ use bincode::{
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{ReplicaId, replica::Log};
+use crate::{ClientId, ReplicaId, replica::Log};
 
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
 const HEADER_SIZE: usize = 4;
@@ -79,7 +79,7 @@ impl Message {
 pub(crate) struct RequestMessage {
     pub(crate) view: ReplicaId,
     pub(crate) request_number: u32,
-    pub(crate) client_id: usize,
+    pub(crate) client_id: ClientId,
     pub(crate) operation: Operation,
 }
 
@@ -96,7 +96,7 @@ pub(crate) struct PrepareOkMessage {
     pub(crate) view: ReplicaId,
     pub(crate) operation_number: usize,
     pub(crate) replica_number: ReplicaId,
-    pub(crate) client_id: usize,
+    pub(crate) client_id: ClientId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]

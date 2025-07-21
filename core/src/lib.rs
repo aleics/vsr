@@ -16,6 +16,7 @@ mod message;
 pub mod replica;
 
 pub type ReplicaId = u8;
+pub type ClientId = u128;
 
 /// `ReplicaOptions` collect the available configuration options for a replica.
 pub struct ReplicaOptions {
@@ -52,7 +53,7 @@ pub struct ClientOptions {
     pub address: String,
 
     /// An identifier for the client
-    pub client_id: usize,
+    pub client_id: ClientId,
 
     /// Socket addresses of all the replicas (e.g. `127.0.0.1:3000`)
     pub replicas: Vec<String>,

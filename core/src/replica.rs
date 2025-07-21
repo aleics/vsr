@@ -9,7 +9,7 @@ use bincode::{Decode, Encode};
 use thiserror::Error;
 
 use crate::{
-    Operation, ReplicaId, Service, ServiceError,
+    ClientId, Operation, ReplicaId, Service, ServiceError,
     bus::ReplicaMessageBus,
     clock::Timeout,
     io::IOError,
@@ -82,7 +82,7 @@ pub struct Replica<S, IO: crate::io::IO> {
 
     /// For each client, the number of its most recent request, plus,
     /// if the request has been executed, the result sent for that request.
-    client_table: HashMap<usize, ClientTableEntry>,
+    client_table: HashMap<u128, ClientTableEntry>,
 
     /// Service container used by the replica to execute client requests.
     service: S,
@@ -942,7 +942,7 @@ impl HandleOutput {
         HandleOutput::Actions(vec![OutputAction::Send { message, replica }])
     }
 
-    fn send_client(reply: ReplyMessage, client_id: usize) -> Self {
+    fn send_client(reply: ReplyMessage, client_id: ClientId) -> Self {
         HandleOutput::Actions(vec![OutputAction::SendClient { reply, client_id }])
     }
 }
@@ -958,7 +958,7 @@ enum OutputAction {
     },
     SendClient {
         reply: ReplyMessage,
-        client_id: usize,
+        client_id: ClientId,
     },
 }
 
@@ -988,7 +988,7 @@ impl Log {
         }
     }
 
-    fn append(&mut self, operation: Operation, request_number: u32, client_id: usize) {
+    fn append(&mut self, operation: Operation, request_number: u32, client_id: ClientId) {
         self.entries.push(LogEntry {
             request_number,
             client_id,
@@ -1041,7 +1041,7 @@ struct LogEntry {
     /// The request number of the log.
     request_number: u32,
     /// The client ID that triggered the request.
-    client_id: usize,
+    client_id: ClientId,
     /// Operation of the request
     operation: Operation,
 }

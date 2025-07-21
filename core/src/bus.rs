@@ -6,7 +6,6 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::{cmp, collections::HashMap, time::Duration};
 
-use crate::ReplicaId;
 use crate::client::ClientConfig;
 use crate::io::IOError;
 use crate::io::SocketLink;
@@ -15,6 +14,7 @@ use crate::message::{
     PrepareOkMessage, RecoveryMessage, RecoveryResponseMessage, ReplyMessage,
     StartViewChangeMessage, StartViewMessage,
 };
+use crate::{ClientId, ReplicaId};
 use crate::{ReplicaConfig, clock::Timeout, io::Completion};
 
 /// The identifier used by the retry timeout used for connecting
@@ -213,7 +213,7 @@ impl<S> Connection<S> {
 /// A `ConnectionPeer` describes what type of node is a connection connected to.
 #[derive(Debug)]
 enum ConnectionPeer {
-    Client { id: usize },
+    Client { id: ClientId },
     Replica { id: ReplicaId },
     Unknown,
 }
@@ -323,7 +323,7 @@ pub(crate) struct ReplicaMessageBus<IO: crate::io::IO> {
 
     /// A key-value map identifying each connected client to the associated
     /// connection identifier.
-    clients: HashMap<usize, usize>,
+    clients: HashMap<u128, usize>,
 
     /// A retry timeout used for connecting to other replicas.
     connect_retry: RetryTimeout,
@@ -618,7 +618,7 @@ impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
     pub(crate) fn send_to_client(
         &mut self,
         reply: ReplyMessage,
-        client_id: usize,
+        client_id: ClientId,
     ) -> Result<bool, IOError> {
         let connection_id = self
             .clients
@@ -662,7 +662,7 @@ impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
 /// messages from replicas.
 pub(crate) struct ClientMessageBus<IO: crate::io::IO> {
     /// The client's identifier
-    client_id: usize,
+    client_id: ClientId,
 
     /// The address of the current replica.
     address: SocketAddr,

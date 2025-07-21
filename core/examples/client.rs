@@ -40,7 +40,7 @@ fn main() {
     let options = ClientOptions {
         seed: args.seed,
         address: args.address,
-        client_id: client_id as usize,
+        client_id: client_id as u128,
         replicas: args.replicas,
     };
 
