@@ -75,11 +75,10 @@ struct Args {
 fn main() {
     tracing_subscriber::fmt::init();
 
-    let seed = 1234;
-    tracing::info!("[main] Seed: {}", seed);
-    let env = Env::new(seed);
+    let args = Args::parse();
+    tracing::info!("[main] Seed: {}", args.seed);
+    let env = Env::new(args.seed);
 
-    // TODO: derive options from seed
     let options = ClusterOptions {
         replica_count: 3,
         client_count: 1,

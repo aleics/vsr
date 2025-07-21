@@ -21,3 +21,11 @@ cargo run --example client -- \
   --address=127.0.0.1:3000 \
   --seed=1234
 ```
+
+## Simulation
+
+Run the simulation:
+
+```shell
+cargo run --bin vsr_simulation -- --seed=1234
+```
