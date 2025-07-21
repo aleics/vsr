@@ -78,7 +78,7 @@ impl Message {
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct RequestMessage {
     pub(crate) view: ReplicaId,
-    pub(crate) request_number: usize,
+    pub(crate) request_number: u32,
     pub(crate) client_id: usize,
     pub(crate) operation: Operation,
 }
@@ -171,7 +171,7 @@ pub(crate) struct RecoveryPrimaryResponse {
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct ReplyMessage {
     pub(crate) view: ReplicaId,
-    pub(crate) request_number: usize,
+    pub(crate) request_number: u32,
     pub(crate) result: Operation,
 }
 

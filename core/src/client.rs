@@ -27,7 +27,7 @@ pub struct Client<IO: crate::io::IO> {
     view: ReplicaId,
 
     /// Internal request number count
-    next_request_number: RefCell<usize>,
+    next_request_number: RefCell<u32>,
 
     /// Communication bus between a client and the replicas
     bus: ClientMessageBus<IO>,

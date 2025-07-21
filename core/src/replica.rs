@@ -988,7 +988,7 @@ impl Log {
         }
     }
 
-    fn append(&mut self, operation: Operation, request_number: usize, client_id: usize) {
+    fn append(&mut self, operation: Operation, request_number: u32, client_id: usize) {
         self.entries.push(LogEntry {
             request_number,
             client_id,
@@ -1039,7 +1039,7 @@ impl Log {
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 struct LogEntry {
     /// The request number of the log.
-    request_number: usize,
+    request_number: u32,
     /// The client ID that triggered the request.
     client_id: usize,
     /// Operation of the request
@@ -1048,7 +1048,7 @@ struct LogEntry {
 
 #[derive(Debug, PartialEq)]
 struct ClientTableEntry {
-    request_number: usize,
+    request_number: u32,
     response: Option<Operation>,
 }
 
