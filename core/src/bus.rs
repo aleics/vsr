@@ -502,7 +502,7 @@ impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
         let Some(message) = Message::decode(&mut connection.incoming_buffer, self.encoding_config)?
         else {
             tracing::error!(
-                "Message could not be decoded (connection_id = {}, replica = {})",
+                "[ReplicaMessageBus::recv] Message could not be decoded (connection_id = {}, replica = {})",
                 connection_id,
                 self.replica
             );
@@ -860,7 +860,7 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
         let Some(message) = Message::decode(&mut connection.incoming_buffer, self.encoding_config)?
         else {
             tracing::error!(
-                "Message could not be decoded (connection_id = {}, client = {})",
+                "[ClientMessageBus::handle_message] Message could not be decoded (connection_id = {}, client = {})",
                 connection_id,
                 self.client_id
             );

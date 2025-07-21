@@ -8,11 +8,16 @@ The current implementation supports all the protocols (_normal_, _view change_, 
 Run the example of a server:
 
 ```shell
-cargo run --example server -- --addresses=127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003 --seed=1234
+cargo run --example server -- \
+  --addresses=127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003 \
+  --seed=1234
 ```
 
 Run the example of a client:
 
 ```shell
-cargo run --example client -- --replicas=127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003 --address=127.0.0.1:3000 --seed=1234
+cargo run --example client -- \
+  --replicas=127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003 \
+  --address=127.0.0.1:3000 \
+  --seed=1234
 ```

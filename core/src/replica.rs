@@ -171,7 +171,7 @@ where
                             let sent = self.bus.send_to_replica(&message, replica)?;
                             if !sent {
                                 tracing::error!(
-                                    "Message could not be sent replica (from: {}, to: {})",
+                                    "[Replica::handle_output] Message could not be sent replica (from: {}, to: {})",
                                     self.replica_number,
                                     replica
                                 );
@@ -181,7 +181,7 @@ where
                             let sent = self.bus.send_to_client(reply, client_id)?;
                             if !sent {
                                 tracing::error!(
-                                    "Message could not be sent client (replica: {}, client: {})",
+                                    "[Replica::handle_output] Message could not be sent client (replica: {}, client: {})",
                                     self.replica_number,
                                     client_id
                                 );
@@ -208,12 +208,10 @@ where
 
     fn handle_err(&mut self, err: &ReplicaError) {
         match err {
-            ReplicaError::Network
-            | ReplicaError::NotReady
-            | ReplicaError::MessageViewMismatch
-            | ReplicaError::IO(_) => {
+            ReplicaError::NotReady | ReplicaError::MessageViewMismatch | ReplicaError::IO(_) => {
                 tracing::warn!(
-                    "Error is not critical. Replica {} ignores message",
+                    "[Replica::handle_err] Error occurred \"{}\" (replica: {})",
+                    err,
                     self.replica_number
                 );
             }
@@ -1133,8 +1131,6 @@ struct RecoveryPrimaryAck {
 pub enum ReplicaError {
     #[error(transparent)]
     IO(#[from] IOError),
-    #[error("A message could not be sent or received")]
-    Network,
     #[error("A replica is not ready to receive requests")]
     NotReady,
     #[error("A replica has an invalid state")]

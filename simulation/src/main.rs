@@ -48,7 +48,7 @@ impl Runner {
                 if !output.is_empty() {
                     for new_counter in output {
                         tracing::info!(
-                            "Client {} received new counter: {}",
+                            "[Runner::tick_clients] Client {} received new counter: {}",
                             client.config.client_id,
                             new_counter
                         );
@@ -76,7 +76,7 @@ fn main() {
     tracing_subscriber::fmt::init();
 
     let seed = 1234;
-    tracing::info!("Seed: {}", seed);
+    tracing::info!("[main] Seed: {}", seed);
     let env = Env::new(seed);
 
     // TODO: derive options from seed
@@ -90,13 +90,13 @@ fn main() {
 
     loop {
         if let Err(err) = runner.tick_replicas() {
-            tracing::error!("Error in replica: {}", err);
+            tracing::error!("[main] Error in replica: {}", err);
         }
 
         // Give some time to the replicas to connect to each other
         if runner.start_time.elapsed() >= Duration::from_secs(1) {
             if let Err(err) = runner.tick_clients() {
-                tracing::error!("Error in client: {}", err);
+                tracing::error!("[main] Error in client: {}", err);
             }
         }
     }
