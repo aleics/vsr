@@ -9,7 +9,7 @@ use bincode::{Decode, Encode};
 use thiserror::Error;
 
 use crate::{
-    Operation, Service, ServiceError,
+    Operation, ReplicaId, Service, ServiceError,
     bus::ReplicaMessageBus,
     clock::Timeout,
     io::IOError,
@@ -31,10 +31,10 @@ pub(crate) struct ReplicaConfig {
     pub(crate) seed: u64,
 
     /// The current replica number given the configuration.
-    pub(crate) replica: usize,
+    pub(crate) replica: ReplicaId,
 
     /// The total amount of replicas.
-    pub(crate) total: usize,
+    pub(crate) total: u8,
 
     /// The socket addresses of all the replicas (including itself).
     pub(crate) addresses: Vec<SocketAddr>,
@@ -43,13 +43,13 @@ pub(crate) struct ReplicaConfig {
 /// A single replica
 pub struct Replica<S, IO: crate::io::IO> {
     /// The current replica number given the configuration.
-    replica_number: usize,
+    replica_number: ReplicaId,
 
     /// Internal view number of the replica.
-    pub(crate) view: usize,
+    pub(crate) view: ReplicaId,
 
     /// The total amount of replicas.
-    total: usize,
+    total: u8,
 
     /// Internal replica state to understand availability.
     status: ReplicaStatus,
@@ -110,7 +110,7 @@ where
         Replica {
             replica_number: config.replica,
             view: 0,
-            total: config.addresses.len(),
+            total: config.addresses.len() as u8,
             status: ReplicaStatus::Normal,
             operation_number: 0,
             log: Log::new(),
@@ -409,7 +409,7 @@ where
             .prepare_acks
             .entry(prepare_ok.operation_number)
             .or_insert(PrepareAck::Waiting {
-                replicas: HashSet::with_capacity(self.total),
+                replicas: HashSet::with_capacity(self.total as usize),
             });
 
         let ack_replicas = match ack {
@@ -873,7 +873,7 @@ where
 
     fn trigger_commit(
         &self,
-        view: usize,
+        view: ReplicaId,
         operation_number: usize,
     ) -> Result<HandleOutput, ReplicaError> {
         // `Commit` messages must only be received by the primary
@@ -923,7 +923,7 @@ where
     }
 }
 
-fn next_replica(replica_number: usize) -> usize {
+fn next_replica(replica_number: ReplicaId) -> ReplicaId {
     replica_number + 1
 }
 
@@ -938,7 +938,7 @@ impl HandleOutput {
         HandleOutput::Actions(vec![OutputAction::Broadcast { message }])
     }
 
-    fn send(message: Message, replica: usize) -> Self {
+    fn send(message: Message, replica: ReplicaId) -> Self {
         HandleOutput::Actions(vec![OutputAction::Send { message, replica }])
     }
 
@@ -954,7 +954,7 @@ enum OutputAction {
     },
     Send {
         message: Message,
-        replica: usize,
+        replica: ReplicaId,
     },
     SendClient {
         reply: ReplyMessage,
@@ -962,10 +962,10 @@ enum OutputAction {
     },
 }
 
-pub(crate) fn quorum(total: usize) -> usize {
+pub(crate) fn quorum(total: u8) -> usize {
     // total = 2 * f + 1
     // f = (total - 1) / 2
-    (total - 1) / 2
+    (total as usize - 1) / 2
 }
 
 /// Create a nonce ("number used once") using the current system time
@@ -1061,13 +1061,13 @@ enum ReplicaStatus {
 
 #[derive(Debug, PartialEq)]
 enum PrepareAck {
-    Waiting { replicas: HashSet<usize> },
+    Waiting { replicas: HashSet<u8> },
     Executed,
 }
 
 #[derive(Debug)]
 struct ViewAck {
-    old_view: usize,
+    old_view: ReplicaId,
     operation_number: usize,
     commit_number: usize,
     log: Log,
@@ -1100,7 +1100,7 @@ impl Ord for ViewAck {
 #[derive(Debug, PartialEq)]
 struct RecoveryAck {
     primary: Option<RecoveryPrimaryAck>,
-    view: usize,
+    view: ReplicaId,
 }
 
 impl RecoveryAck {
@@ -1124,7 +1124,7 @@ struct RecoveryPrimaryAck {
     log: Log,
     operation_number: usize,
     commit_number: usize,
-    view: usize,
+    view: ReplicaId,
 }
 
 #[derive(Error, Debug)]
@@ -1152,7 +1152,7 @@ mod tests {
     use bytes::{Bytes, BytesMut};
 
     use crate::{
-        Operation, ReplicaOptions, encode_operation,
+        Operation, ReplicaId, ReplicaOptions, encode_operation,
         io::{AcceptedConnection, IO, SocketLink},
         message::{
             CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     struct MockReplicaBuilder {
-        replica_number: usize,
+        replica_number: ReplicaId,
         addresses: Vec<String>,
     }
 

@@ -53,7 +53,7 @@ fn main() {
     for i in 0..replica_addresses.len() {
         let replica_options = ReplicaOptions {
             seed,
-            current: i,
+            current: i as u8,
             addresses: replica_addresses.clone(),
         };
 

@@ -43,7 +43,7 @@ fn main() {
         let options = ReplicaOptions {
             seed: args.seed,
             addresses: args.addresses.clone(),
-            current: replica_number,
+            current: replica_number as u8,
         };
 
         let mut replica = start_replica(&options);

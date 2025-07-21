@@ -93,10 +93,10 @@ fn main() {
         }
 
         // Give some time to the replicas to connect to each other
-        if runner.start_time.elapsed() >= Duration::from_secs(1) {
-            if let Err(err) = runner.tick_clients() {
-                tracing::error!("[main] Error in client: {}", err);
-            }
+        if runner.start_time.elapsed() >= Duration::from_secs(1)
+            && let Err(err) = runner.tick_clients()
+        {
+            tracing::error!("[main] Error in client: {}", err);
         }
     }
 }

@@ -6,15 +6,15 @@ use crate::{
 };
 
 use super::io::{FaultyIO, FaultyIOProbs};
-use vsr::{ClientOptions, ReplicaOptions, Service, client::Client, replica::Replica};
+use vsr::{ClientOptions, ReplicaId, ReplicaOptions, Service, client::Client, replica::Replica};
 
 const CLUSTER_IP: &str = "127.0.0.1";
 const REPLICA_BASE_PORT: u32 = 3000;
 const CLIENT_BASE_PORT: u32 = 8000;
 
 pub(crate) struct ClusterOptions {
-    pub(crate) replica_count: u8,
-    pub(crate) client_count: u8,
+    pub(crate) replica_count: ReplicaId,
+    pub(crate) client_count: ReplicaId,
 }
 
 pub(crate) struct Cluster {
@@ -69,7 +69,7 @@ fn create_replicas(
     for replica in 0..options.replica_count {
         let options = ReplicaOptions {
             seed: env.seed,
-            current: replica as usize,
+            current: replica,
             addresses: addresses.clone(),
         };
         let service = SimService::default();

@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::{cmp, collections::HashMap, time::Duration};
 
+use crate::ReplicaId;
 use crate::client::ClientConfig;
 use crate::io::IOError;
 use crate::io::SocketLink;
@@ -35,14 +36,14 @@ const TICK_TIMEOUT_NS: u64 = 200;
 struct RetryTimeout {
     /// Contains the amount of attempts for each replica, along with
     /// its associated timeout
-    attempts: HashMap<usize, (u32, Timeout)>,
+    attempts: HashMap<ReplicaId, (u32, Timeout)>,
 }
 
 impl RetryTimeout {
     /// Create a new retry timeout. The `id` identifies the retry timeout.
     /// `after` defines the amount of ticks the timeout should use.
     /// `attempts` defines the
-    fn new(id: &str, after: u64, replicas: Vec<usize>) -> Self {
+    fn new(id: &str, after: u64, replicas: Vec<ReplicaId>) -> Self {
         let attempts = replicas
             .into_iter()
             .map(|replica| {
@@ -72,7 +73,7 @@ impl RetryTimeout {
 
     /// Check if a given replica should try another attempt.
     /// In case no attempts have been tried yet, it returns `true`.
-    fn should_retry(&self, replica: usize) -> bool {
+    fn should_retry(&self, replica: ReplicaId) -> bool {
         let Some((attempts, timeout)) = self.attempts.get(&replica) else {
             return false;
         };
@@ -85,7 +86,7 @@ impl RetryTimeout {
     }
 
     /// Reset the retry timeout used by a given replica.
-    fn reset(&mut self, replica: usize) {
+    fn reset(&mut self, replica: ReplicaId) {
         if let Some((attempts, timeout)) = self.attempts.get_mut(&replica) {
             *attempts = 0;
             timeout.reset();
@@ -94,7 +95,7 @@ impl RetryTimeout {
 
     /// Increase the retry timeout of a given replica using exponential
     /// backoff with jitter defined by `rng`.
-    fn increase(&mut self, replica: usize, rng: &mut ChaCha8Rng) {
+    fn increase(&mut self, replica: ReplicaId, rng: &mut ChaCha8Rng) {
         let Some((attempts, timeout)) = self.attempts.get_mut(&replica) else {
             return;
         };
@@ -213,7 +214,7 @@ impl<S> Connection<S> {
 #[derive(Debug)]
 enum ConnectionPeer {
     Client { id: usize },
-    Replica { id: usize },
+    Replica { id: ReplicaId },
     Unknown,
 }
 
@@ -314,11 +315,11 @@ pub(crate) struct ReplicaMessageBus<IO: crate::io::IO> {
     connection_pool: ConnectionPool<IO::Link>,
 
     /// The current replica's identifier.
-    replica: usize,
+    replica: ReplicaId,
 
     /// A key-value map identifying each connected replica to the associated
     /// connection identifier.
-    replicas: HashMap<usize, usize>,
+    replicas: HashMap<ReplicaId, usize>,
 
     /// A key-value map identifying each connected client to the associated
     /// connection identifier.
@@ -340,20 +341,21 @@ pub(crate) struct ReplicaMessageBus<IO: crate::io::IO> {
 impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
     /// Create a new instance of a message bus for the local replica.
     pub(crate) fn new(config: &ReplicaConfig, io: IO) -> Self {
-        let current_address = config.addresses.get(config.replica).unwrap();
+        let current_address = config.addresses.get(config.replica as usize).unwrap();
         let encoding_config = bincode::config::standard();
 
         let mut connections = ConnectionPool::new();
         let mut replicas = HashMap::with_capacity(config.addresses.len() - 1);
-        let mut connect_attempts = Vec::with_capacity(config.addresses.len() - config.replica + 1);
+        let mut connect_attempts =
+            Vec::with_capacity(config.addresses.len() - config.replica as usize + 1);
 
         // Create a fix amount of connection to the other replicas.
         // It will connect to the next replicas as defined in the configuration to prevent conflicts.
-        for replica in (config.replica + 1)..config.addresses.len() {
+        for replica in (config.replica as usize + 1)..config.addresses.len() {
             let address = config.addresses.get(replica).unwrap();
             let connection_id = connections.add(Connection::new(*address, encoding_config));
-            replicas.insert(replica, connection_id);
-            connect_attempts.push(replica);
+            replicas.insert(replica as u8, connection_id);
+            connect_attempts.push(replica as u8);
         }
 
         ReplicaMessageBus {
@@ -415,7 +417,7 @@ impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
 
     /// Connect to a replica using an associated connection identifier. In case the connection
     /// is successful, the connection identifier is returned.
-    fn connect_to_replica(&mut self, replica: usize, connection_id: usize) -> Option<usize> {
+    fn connect_to_replica(&mut self, replica: ReplicaId, connection_id: usize) -> Option<usize> {
         let connection = self.connection_pool.get_mut(connection_id)
             .unwrap_or_else(|| panic!("Connection must be initialized (replica: {replica}, connection_id: {connection_id})"));
 
@@ -555,7 +557,7 @@ impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
     pub(crate) fn send_to_replica(
         &mut self,
         message: &Message,
-        replica: usize,
+        replica: u8,
     ) -> Result<bool, IOError> {
         let connection_id = self
             .replicas
@@ -673,7 +675,7 @@ pub(crate) struct ClientMessageBus<IO: crate::io::IO> {
 
     /// A key-value map identifying each connected replica to the associated
     /// connection identifier.
-    replicas: HashMap<usize, usize>,
+    replicas: HashMap<u8, usize>,
 
     /// A retry timeout used for connecting to the replicas.
     connect_retry: RetryTimeout,
@@ -699,8 +701,8 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
         // Connect to all the known replicas.
         for (replica, address) in config.replicas.iter().enumerate() {
             let connection_id = connection_pool.add(Connection::new(*address, encoding_config));
-            replicas.insert(replica, connection_id);
-            connect_attempts.push(replica);
+            replicas.insert(replica as u8, connection_id);
+            connect_attempts.push(replica as u8);
         }
 
         ClientMessageBus {
@@ -776,7 +778,7 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
 
     /// Connect to a replica using an associated connection identifier. In case the connection
     /// is successful, the connection identifier is returned.
-    fn connect_to_replica(&mut self, replica: usize, connection_id: usize) -> Option<usize> {
+    fn connect_to_replica(&mut self, replica: ReplicaId, connection_id: usize) -> Option<usize> {
         let connection = self.connection_pool.get_mut(connection_id)
             .unwrap_or_else(|| panic!("Connection must be initialized (replica: {replica}, connection_id: {connection_id})"));
 
@@ -905,7 +907,7 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
     pub(crate) fn send_to_replica(
         &mut self,
         message: &Message,
-        replica: usize,
+        replica: ReplicaId,
     ) -> Result<(), IOError> {
         let connection_id = self
             .replicas

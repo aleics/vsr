@@ -8,7 +8,7 @@ use bincode::{
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::replica::Log;
+use crate::{ReplicaId, replica::Log};
 
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
 const HEADER_SIZE: usize = 4;
@@ -77,7 +77,7 @@ impl Message {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct RequestMessage {
-    pub(crate) view: usize,
+    pub(crate) view: ReplicaId,
     pub(crate) request_number: usize,
     pub(crate) client_id: usize,
     pub(crate) operation: Operation,
@@ -85,7 +85,7 @@ pub(crate) struct RequestMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct PrepareMessage {
-    pub(crate) view: usize,
+    pub(crate) view: ReplicaId,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
     pub(crate) request: RequestMessage,
@@ -93,30 +93,30 @@ pub(crate) struct PrepareMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct PrepareOkMessage {
-    pub(crate) view: usize,
+    pub(crate) view: ReplicaId,
     pub(crate) operation_number: usize,
-    pub(crate) replica_number: usize,
+    pub(crate) replica_number: ReplicaId,
     pub(crate) client_id: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct CommitMessage {
-    pub(crate) replica_number: usize,
-    pub(crate) view: usize,
+    pub(crate) replica_number: ReplicaId,
+    pub(crate) view: ReplicaId,
     pub(crate) operation_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct GetStateMessage {
-    pub(crate) view: usize,
+    pub(crate) view: ReplicaId,
     pub(crate) operation_number: usize,
-    pub(crate) replica_number: usize,
+    pub(crate) replica_number: ReplicaId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct NewStateMessage {
-    pub(crate) view: usize,
-    pub(crate) replica_number: usize,
+    pub(crate) view: ReplicaId,
+    pub(crate) replica_number: ReplicaId,
     pub(crate) log_after_operation: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
@@ -124,24 +124,24 @@ pub(crate) struct NewStateMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct StartViewChangeMessage {
-    pub(crate) new_view: usize,
-    pub(crate) replica_number: usize,
+    pub(crate) new_view: ReplicaId,
+    pub(crate) replica_number: ReplicaId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct DoViewChangeMessage {
-    pub(crate) old_view: usize,
-    pub(crate) new_view: usize,
+    pub(crate) old_view: ReplicaId,
+    pub(crate) new_view: ReplicaId,
     pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
-    pub(crate) replica_number: usize,
+    pub(crate) replica_number: ReplicaId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct StartViewMessage {
-    pub(crate) replica_number: usize,
-    pub(crate) view: usize,
+    pub(crate) replica_number: ReplicaId,
+    pub(crate) view: ReplicaId,
     pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
@@ -149,14 +149,14 @@ pub(crate) struct StartViewMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct RecoveryMessage {
-    pub(crate) replica_number: usize,
+    pub(crate) replica_number: ReplicaId,
     pub(crate) nonce: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct RecoveryResponseMessage {
-    pub(crate) replica_number: usize,
-    pub(crate) view: usize,
+    pub(crate) replica_number: ReplicaId,
+    pub(crate) view: ReplicaId,
     pub(crate) nonce: u64,
     pub(crate) primary: Option<RecoveryPrimaryResponse>,
 }
@@ -170,7 +170,7 @@ pub(crate) struct RecoveryPrimaryResponse {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct ReplyMessage {
-    pub(crate) view: usize,
+    pub(crate) view: ReplicaId,
     pub(crate) request_number: usize,
     pub(crate) result: Operation,
 }

@@ -4,7 +4,7 @@ use bincode::{Decode, Encode};
 use thiserror::Error;
 
 use crate::{
-    ClientOptions, InputError,
+    ClientOptions, InputError, ReplicaId,
     bus::ClientMessageBus,
     decode_operation, encode_operation,
     io::IOError,
@@ -24,7 +24,7 @@ pub struct Client<IO: crate::io::IO> {
     pub config: ClientConfig,
 
     /// Internal view number of the replica
-    view: usize,
+    view: ReplicaId,
 
     /// Internal request number count
     next_request_number: RefCell<usize>,
@@ -34,7 +34,7 @@ pub struct Client<IO: crate::io::IO> {
 }
 
 impl<IO: crate::io::IO> Client<IO> {
-    pub fn new(options: &ClientOptions, view: usize, io: IO) -> Result<Self, ClientError> {
+    pub fn new(options: &ClientOptions, view: ReplicaId, io: IO) -> Result<Self, ClientError> {
         let config = options.parse()?;
 
         let bus = ClientMessageBus::new(&config, io);

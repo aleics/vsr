@@ -15,12 +15,14 @@ pub mod io;
 mod message;
 pub mod replica;
 
+pub type ReplicaId = u8;
+
 /// `ReplicaOptions` collect the available configuration options for a replica.
 pub struct ReplicaOptions {
     pub seed: u64,
 
     /// The current replica index matching a position in `addresses`.
-    pub current: usize,
+    pub current: ReplicaId,
 
     /// Socket addresses of all the replicas (e.g. `127.0.0.1:3000`)
     pub addresses: Vec<String>,
@@ -36,7 +38,7 @@ impl ReplicaOptions {
         Ok(ReplicaConfig {
             seed: self.seed,
             replica: self.current,
-            total: socket_addresses.len(),
+            total: socket_addresses.len() as u8,
             addresses: socket_addresses,
         })
     }
@@ -85,7 +87,7 @@ pub fn replica<S: Service<Input = I, Output = O>, I: Decode<()>, O: Encode, IO: 
 /// Create a new client given certain options and known `view`.
 pub fn client<IO: crate::io::IO>(
     options: &ClientOptions,
-    view: usize,
+    view: ReplicaId,
     io: IO,
 ) -> Result<Client<IO>, ClientError> {
     Client::new(options, view, io)
