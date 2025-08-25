@@ -9,6 +9,7 @@ use replica::{Replica, ReplicaConfig, ReplicaError};
 use thiserror::Error;
 
 mod bus;
+mod checksum;
 pub mod client;
 mod clock;
 pub mod io;
