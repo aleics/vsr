@@ -7,30 +7,70 @@ use bincode::{
     error::{DecodeError, EncodeError},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use thiserror::Error;
 
-use crate::{ClientId, ReplicaId, replica::Log};
+use crate::{ClientId, ReplicaId, checksum::checksum, replica::Log};
 
-pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
-const MESSAGE_SIZE_BYTES: usize = 4;
-
+/// BundledHeader represents the header of a bundled message. It's used
+/// to verify the integrity of the message.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub(crate) enum Message {
-    Request(RequestMessage),
-    Prepare(PrepareMessage),
-    PrepareOk(PrepareOkMessage),
-    Commit(CommitMessage),
-    GetState(GetStateMessage),
-    NewState(NewStateMessage),
-    StartViewChange(StartViewChangeMessage),
-    DoViewChange(DoViewChangeMessage),
-    StartView(StartViewMessage),
-    Recovery(RecoveryMessage),
-    RecoveryResponse(RecoveryResponseMessage),
-    Reply(ReplyMessage),
+pub(crate) struct BundledHeader {
+    pub(crate) checksum: u128,
 }
 
-impl Message {
-    /// Encode the [`Message`] in binary, by appending the message with its size
+impl BundledHeader {
+    /// Creates a new BundledHeader for a given message.
+    fn for_message(message: &[u8]) -> Self {
+        BundledHeader {
+            checksum: checksum(message),
+        }
+    }
+
+    /// Verifies the checksum of the message by calculating the checksum of
+    /// the message and comparing it to the stored checksum.
+    pub fn verify_checksum(&self, message: &[u8]) -> bool {
+        self.checksum == checksum(message)
+    }
+}
+
+#[derive(Error, Debug)]
+pub(crate) enum UnbundleError {
+    #[error("Message checksum mismatch")]
+    ChecksumMismatch,
+    #[error(transparent)]
+    DecodeError(#[from] DecodeError),
+}
+
+/// BundledMessage represents a message that has been bundled for transmission.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct BundledMessage {
+    header: BundledHeader,
+    body: Vec<u8>,
+}
+
+impl BundledMessage {
+    /// Bundle a message for transmission.
+    pub(crate) fn bundle(
+        message: &Message,
+        config: Configuration,
+    ) -> Result<BundledMessage, EncodeError> {
+        let body = bincode::encode_to_vec(message, config)?;
+        let header = BundledHeader::for_message(&body);
+
+        Ok(BundledMessage { header, body })
+    }
+
+    /// Unbundle a message by verifying its content and decoding it.
+    pub(crate) fn unbundle(&self, config: Configuration) -> Result<Message, UnbundleError> {
+        if !self.header.verify_checksum(&self.body) {
+            return Err(UnbundleError::ChecksumMismatch);
+        }
+
+        let (message, _) = bincode::decode_from_slice(&self.body, config)?;
+        Ok(message)
+    }
+
+    /// Encode the [`BundledMessage`] in binary, by appending the message with its size
     /// (framing), so that only the necessary bit size is used when decoding.
     pub(crate) fn encode(&self, config: Configuration) -> Result<Bytes, EncodeError> {
         let payload = bincode::encode_to_vec(self, config)?;
@@ -48,8 +88,8 @@ impl Message {
         Ok(buf.freeze())
     }
 
-    /// Decode the given bytes into a [`Message`] using the framing implemented
-    /// in [`Message::encode`]
+    /// Decode the given bytes into a [`BundledMessage`] using the framing implemented
+    /// in [`BundledMessage::encode`]
     pub(crate) fn decode(
         buf: &mut BytesMut,
         config: Configuration,
@@ -73,6 +113,30 @@ impl Message {
         let (message, _) = bincode::decode_from_slice(&payload.freeze(), config)?;
         Ok(Some(message))
     }
+}
+
+pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
+const MESSAGE_SIZE_BYTES: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct Header {
+    pub(crate) view: ReplicaId,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) enum Message {
+    Request(RequestMessage),
+    Prepare(PrepareMessage),
+    PrepareOk(PrepareOkMessage),
+    Commit(CommitMessage),
+    GetState(GetStateMessage),
+    NewState(NewStateMessage),
+    StartViewChange(StartViewChangeMessage),
+    DoViewChange(DoViewChangeMessage),
+    StartView(StartViewMessage),
+    Recovery(RecoveryMessage),
+    RecoveryResponse(RecoveryResponseMessage),
+    Reply(ReplyMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]

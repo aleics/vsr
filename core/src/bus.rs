@@ -205,7 +205,8 @@ impl<S> Connection<S> {
 
     /// Queue a new message into the outgoing buffer
     fn queue_message(&mut self, message: &Message) -> Result<(), IOError> {
-        let buffer = message.encode(self.encoding_config)?;
+        let bundled = BundledMessage::bundle(message, self.encoding_config)?;
+        let buffer = bundled.encode(self.encoding_config)?;
         self.outgoing_buffer.add(buffer);
 
         Ok(())
@@ -526,10 +527,20 @@ impl<IO: crate::io::IO> ReplicaMessageBus<IO> {
             return Ok(None);
         }
 
-        let Some(message) = Message::decode(&mut connection.incoming_buffer, self.encoding_config)?
+        let Some(bundled) =
+            BundledMessage::decode(&mut connection.incoming_buffer, self.encoding_config)?
         else {
             tracing::error!(
                 "[ReplicaMessageBus::recv] Message could not be decoded (connection_id = {}, replica = {})",
+                connection_id,
+                self.replica
+            );
+            return Ok(None);
+        };
+
+        let Ok(message) = bundled.unbundle(self.encoding_config) else {
+            tracing::error!(
+                "[ReplicaMessageBus::recv] Message could not be unbundled (connection_id = {}, replica = {})",
                 connection_id,
                 self.replica
             );
@@ -884,10 +895,20 @@ impl<IO: crate::io::IO> ClientMessageBus<IO> {
             return Ok(None);
         }
 
-        let Some(message) = Message::decode(&mut connection.incoming_buffer, self.encoding_config)?
+        let Some(bundled) =
+            BundledMessage::decode(&mut connection.incoming_buffer, self.encoding_config)?
         else {
             tracing::error!(
                 "[ClientMessageBus::handle_message] Message could not be decoded (connection_id = {}, client = {})",
+                connection_id,
+                self.client_id
+            );
+            return Ok(None);
+        };
+
+        let Ok(message) = bundled.unbundle(self.encoding_config) else {
+            tracing::error!(
+                "[ClientMessageBus::recv] Message could not be unbundled (connection_id = {}, client = {})",
                 connection_id,
                 self.client_id
             );
