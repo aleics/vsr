@@ -11,7 +11,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::{ClientId, ReplicaId, replica::Log};
 
 pub(crate) const MESSAGE_SIZE_MAX: usize = 8 * 1024;
-const HEADER_SIZE: usize = 4;
+const MESSAGE_SIZE_BYTES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) enum Message {
@@ -38,7 +38,7 @@ impl Message {
             return Ok(Bytes::new());
         }
 
-        let message_size = payload.len() + HEADER_SIZE;
+        let message_size = payload.len() + MESSAGE_SIZE_BYTES;
         let mut buf = BytesMut::with_capacity(message_size);
 
         // Append the encoded content with its length
@@ -53,21 +53,21 @@ impl Message {
     pub(crate) fn decode(
         buf: &mut BytesMut,
         config: Configuration,
-    ) -> Result<Option<Message>, DecodeError> {
-        if buf.len() < HEADER_SIZE {
+    ) -> Result<Option<Self>, DecodeError> {
+        if buf.len() < MESSAGE_SIZE_BYTES {
             return Ok(None);
         }
 
         // Read the first 4 bytes (`u32`) containing the size of the message
-        let mut cursor = Cursor::new(&buf[..HEADER_SIZE]);
+        let mut cursor = Cursor::new(&buf[..MESSAGE_SIZE_BYTES]);
         let length = cursor.get_u32() as usize;
 
-        if buf.len() < HEADER_SIZE + length {
+        if buf.len() < MESSAGE_SIZE_BYTES + length {
             return Ok(None);
         }
 
         // Decode the message's payload
-        buf.advance(HEADER_SIZE);
+        buf.advance(MESSAGE_SIZE_BYTES);
         let payload = buf.split_to(length);
 
         let (message, _) = bincode::decode_from_slice(&payload.freeze(), config)?;
@@ -77,7 +77,12 @@ impl Message {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct RequestMessage {
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: RequestMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct RequestMessageBody {
     pub(crate) request_number: u32,
     pub(crate) client_id: ClientId,
     pub(crate) operation: Operation,
@@ -85,7 +90,12 @@ pub(crate) struct RequestMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct PrepareMessage {
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: PrepareMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct PrepareMessageBody {
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
     pub(crate) request: RequestMessage,
@@ -93,30 +103,50 @@ pub(crate) struct PrepareMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct PrepareOkMessage {
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: PrepareOkMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct PrepareOkMessageBody {
     pub(crate) operation_number: usize,
-    pub(crate) replica_number: ReplicaId,
+    pub(crate) replica: ReplicaId,
     pub(crate) client_id: ClientId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct CommitMessage {
-    pub(crate) replica_number: ReplicaId,
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: CommitMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct CommitMessageBody {
+    pub(crate) replica: ReplicaId,
     pub(crate) operation_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct GetStateMessage {
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: GetStateMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct GetStateMessageBody {
     pub(crate) operation_number: usize,
-    pub(crate) replica_number: ReplicaId,
+    pub(crate) replica: ReplicaId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct NewStateMessage {
-    pub(crate) view: ReplicaId,
-    pub(crate) replica_number: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: NewStateMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct NewStateMessageBody {
+    pub(crate) replica: ReplicaId,
     pub(crate) log_after_operation: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
@@ -124,24 +154,41 @@ pub(crate) struct NewStateMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct StartViewChangeMessage {
+    pub(crate) header: Header,
+    pub(crate) body: StartViewChangeMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct StartViewChangeMessageBody {
     pub(crate) new_view: ReplicaId,
-    pub(crate) replica_number: ReplicaId,
+    pub(crate) replica: ReplicaId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct DoViewChangeMessage {
+    pub(crate) header: Header,
+    pub(crate) body: DoViewChangeMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct DoViewChangeMessageBody {
     pub(crate) old_view: ReplicaId,
     pub(crate) new_view: ReplicaId,
     pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
-    pub(crate) replica_number: ReplicaId,
+    pub(crate) replica: ReplicaId,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct StartViewMessage {
-    pub(crate) replica_number: ReplicaId,
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: StartViewMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct StartViewMessageBody {
+    pub(crate) replica: ReplicaId,
     pub(crate) log: Log,
     pub(crate) operation_number: usize,
     pub(crate) commit_number: usize,
@@ -149,14 +196,25 @@ pub(crate) struct StartViewMessage {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct RecoveryMessage {
-    pub(crate) replica_number: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: RecoveryMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct RecoveryMessageBody {
+    pub(crate) replica: ReplicaId,
     pub(crate) nonce: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct RecoveryResponseMessage {
-    pub(crate) replica_number: ReplicaId,
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: RecoveryResponseMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct RecoveryResponseMessageBody {
+    pub(crate) replica: ReplicaId,
     pub(crate) nonce: u64,
     pub(crate) primary: Option<RecoveryPrimaryResponse>,
 }
@@ -170,7 +228,12 @@ pub(crate) struct RecoveryPrimaryResponse {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(crate) struct ReplyMessage {
-    pub(crate) view: ReplicaId,
+    pub(crate) header: Header,
+    pub(crate) body: ReplyMessageBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub(crate) struct ReplyMessageBody {
     pub(crate) request_number: u32,
     pub(crate) result: Operation,
 }
@@ -214,34 +277,42 @@ mod tests {
 
     use crate::{
         Operation,
-        message::{Message, RequestMessage},
+        message::{BundledMessage, Header, Message, RequestMessage, RequestMessageBody},
     };
 
     #[test]
     fn test_encode_decode_single_message() {
         // given
         let message = Message::Request(RequestMessage {
-            view: 0,
-            request_number: 0,
-            client_id: 0,
-            operation: Operation::from(Bytes::from(vec![1, 2, 3])),
+            header: Header { view: 0 },
+            body: RequestMessageBody {
+                request_number: 0,
+                client_id: 0,
+                operation: Operation::from(Bytes::from(vec![1, 2, 3])),
+            },
         });
         let config = bincode::config::standard();
 
         // when
-        let encoded = message.encode(config).unwrap();
+        let bundled = BundledMessage::bundle(&message, config).unwrap();
+        let encoded = bundled.encode(config).unwrap();
         let mut encoded = BytesMut::from(encoded);
-        let decoded = Message::decode(&mut encoded, config).unwrap();
+        let decoded = BundledMessage::decode(&mut encoded, config)
+            .unwrap()
+            .unwrap();
+        let unbundled = decoded.unbundle(config).unwrap();
 
         // then
         assert_eq!(
-            decoded,
-            Some(Message::Request(RequestMessage {
-                view: 0,
-                request_number: 0,
-                client_id: 0,
-                operation: Operation::from(Bytes::from(vec![1, 2, 3])),
-            }))
+            unbundled,
+            Message::Request(RequestMessage {
+                header: Header { view: 0 },
+                body: RequestMessageBody {
+                    request_number: 0,
+                    client_id: 0,
+                    operation: Operation::from(Bytes::from(vec![1, 2, 3]))
+                },
+            })
         );
     }
 }

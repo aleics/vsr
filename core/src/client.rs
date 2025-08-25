@@ -8,7 +8,7 @@ use crate::{
     bus::ClientMessageBus,
     decode_operation, encode_operation,
     io::IOError,
-    message::{Message, RequestMessage},
+    message::{Header, Message, RequestMessage, RequestMessageBody},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,10 +59,12 @@ impl<IO: crate::io::IO> Client<IO> {
         let mut request_number = self.next_request_number.borrow_mut();
 
         let message = RequestMessage {
-            client_id: self.config.client_id,
-            view: self.view,
-            request_number: *request_number,
-            operation: encode_operation(operation)?,
+            header: Header { view: self.view },
+            body: RequestMessageBody {
+                client_id: self.config.client_id,
+                request_number: *request_number,
+                operation: encode_operation(operation)?,
+            },
         };
 
         self.bus
@@ -82,7 +84,7 @@ impl<IO: crate::io::IO> Client<IO> {
                 continue;
             };
 
-            let response = decode_operation(&reply.result)?;
+            let response = decode_operation(&reply.body.result)?;
             responses.push(response);
         }
 

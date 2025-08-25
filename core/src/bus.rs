@@ -10,9 +10,11 @@ use crate::client::ClientConfig;
 use crate::io::IOError;
 use crate::io::SocketLink;
 use crate::message::{
-    CommitMessage, DoViewChangeMessage, GetStateMessage, Message, NewStateMessage,
-    PrepareOkMessage, RecoveryMessage, RecoveryResponseMessage, ReplyMessage,
-    StartViewChangeMessage, StartViewMessage,
+    BundledMessage, CommitMessage, CommitMessageBody, DoViewChangeMessage, DoViewChangeMessageBody,
+    GetStateMessage, GetStateMessageBody, Message, NewStateMessage, NewStateMessageBody,
+    PrepareOkMessage, PrepareOkMessageBody, RecoveryMessage, RecoveryMessageBody,
+    RecoveryResponseMessage, RecoveryResponseMessageBody, ReplyMessage, StartViewChangeMessage,
+    StartViewChangeMessageBody, StartViewMessage, StartViewMessageBody,
 };
 use crate::{ClientId, ReplicaId};
 use crate::{ReplicaConfig, clock::Timeout, io::Completion};
@@ -223,22 +225,45 @@ impl ConnectionPeer {
     fn from_message(message: &Message) -> ConnectionPeer {
         match message {
             Message::Request(request) => ConnectionPeer::Client {
-                id: request.client_id,
+                id: request.body.client_id,
             },
             Message::Prepare(..) | Message::Reply(..) => ConnectionPeer::Unknown,
-            Message::PrepareOk(PrepareOkMessage { replica_number, .. })
-            | Message::Commit(CommitMessage { replica_number, .. })
-            | Message::GetState(GetStateMessage { replica_number, .. })
-            | Message::StartViewChange(StartViewChangeMessage { replica_number, .. })
-            | Message::StartView(StartViewMessage { replica_number, .. })
-            | Message::DoViewChange(DoViewChangeMessage { replica_number, .. })
-            | Message::NewState(NewStateMessage { replica_number, .. })
-            | Message::Recovery(RecoveryMessage { replica_number, .. })
-            | Message::RecoveryResponse(RecoveryResponseMessage { replica_number, .. }) => {
-                ConnectionPeer::Replica {
-                    id: *replica_number,
-                }
-            }
+            Message::PrepareOk(PrepareOkMessage {
+                body: PrepareOkMessageBody { replica, .. },
+                ..
+            })
+            | Message::Commit(CommitMessage {
+                body: CommitMessageBody { replica, .. },
+                ..
+            })
+            | Message::GetState(GetStateMessage {
+                body: GetStateMessageBody { replica, .. },
+                ..
+            })
+            | Message::StartViewChange(StartViewChangeMessage {
+                body: StartViewChangeMessageBody { replica, .. },
+                ..
+            })
+            | Message::StartView(StartViewMessage {
+                body: StartViewMessageBody { replica, .. },
+                ..
+            })
+            | Message::DoViewChange(DoViewChangeMessage {
+                body: DoViewChangeMessageBody { replica, .. },
+                ..
+            })
+            | Message::NewState(NewStateMessage {
+                body: NewStateMessageBody { replica, .. },
+                ..
+            })
+            | Message::Recovery(RecoveryMessage {
+                body: RecoveryMessageBody { replica, .. },
+                ..
+            })
+            | Message::RecoveryResponse(RecoveryResponseMessage {
+                body: RecoveryResponseMessageBody { replica, .. },
+                ..
+            }) => ConnectionPeer::Replica { id: *replica },
         }
     }
 }
