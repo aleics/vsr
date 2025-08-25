@@ -93,7 +93,7 @@ fn create_clients(
     lookup: ConnectionLookup,
     options: &ClusterOptions,
 ) -> Vec<Client<FaultyIO>> {
-    let mut clients = Vec::with_capacity(options.client_count as usize);
+    let mut clients = Vec::with_capacity(options.client_count);
 
     for client in 0..options.client_count {
         let options = ClientOptions {

@@ -85,7 +85,7 @@ pub struct Replica<S, IO: crate::io::IO> {
 
     /// For each client, the number of its most recent request, plus,
     /// if the request has been executed, the result sent for that request.
-    client_table: HashMap<u128, ClientTableEntry>,
+    client_table: ClientTable,
 
     /// Service container used by the replica to execute client requests.
     service: S,
@@ -122,7 +122,7 @@ where
             prepare_acks: HashMap::default(),
             view_acks: BinaryHeap::new(),
             recovery_acks: Vec::new(),
-            client_table: HashMap::default(),
+            client_table: ClientTable::new(),
             bus,
             service,
             health,
@@ -288,7 +288,7 @@ where
         // If the request-number isn’t bigger than the information in the client table it drops the
         // request, but it will re-send the response if the request is the most recent one from this
         // client and it has already been executed.
-        if let Some(most_recent_request) = self.client_table.get(&request.body.client_id) {
+        if let Some(most_recent_request) = self.client_table.read(&request.body.client_id) {
             if most_recent_request.request_number > request.body.request_number {
                 return Ok(HandleOutput::DoNothing);
             }
@@ -319,7 +319,7 @@ where
             request.body.request_number,
             request.body.client_id,
         );
-        self.client_table.insert(
+        self.client_table.add(
             request.body.client_id,
             ClientTableEntry {
                 request_number: request.body.request_number,
@@ -369,7 +369,7 @@ where
             prepare.body.request.body.request_number,
             prepare.body.request.body.client_id,
         );
-        self.client_table.insert(
+        self.client_table.add(
             prepare.body.request.body.client_id,
             ClientTableEntry {
                 request_number: prepare.body.request.body.request_number,
@@ -456,11 +456,9 @@ where
         self.prepare_acks
             .insert(prepare_ok.body.operation_number, PrepareAck::Executed);
 
-        let client_request = self.client_table.get_mut(&prepare_ok.body.client_id)
-            .expect("Client must be present in the client table since the request message has been already received");
-
         // The primary also updates the client's entry in the client-table to contain the result
-        client_request.response = Some(result.clone());
+        let client_request = self.client_table.update_response(&prepare_ok.body.client_id, result.clone())
+            .expect("Client must be present in the client table since the request message has been already received");
 
         // Send reply message to the client
         Ok(HandleOutput::send_client(
@@ -1094,6 +1092,49 @@ struct LogEntry {
 }
 
 #[derive(Debug, PartialEq)]
+struct ClientTable {
+    entries: HashMap<u128, ClientTableEntry>,
+}
+
+impl ClientTable {
+    pub fn new() -> Self {
+        ClientTable {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, client_id: u128, entry: ClientTableEntry) {
+        self.entries.insert(client_id, entry);
+    }
+
+    fn read(&self, client_id: &u128) -> Option<&ClientTableEntry> {
+        self.entries.get(client_id)
+    }
+
+    fn update_response(
+        &mut self,
+        client_id: &u128,
+        operation: Operation,
+    ) -> Option<&ClientTableEntry> {
+        let entry = self.entries.get_mut(client_id)?;
+        entry.response = Some(operation);
+        Some(entry)
+    }
+
+    fn extend(&mut self, entries: HashMap<u128, ClientTableEntry>) {
+        self.entries.extend(entries);
+    }
+}
+
+impl FromIterator<(u128, ClientTableEntry)> for ClientTable {
+    fn from_iter<T: IntoIterator<Item = (u128, ClientTableEntry)>>(iter: T) -> Self {
+        let mut table = ClientTable::new();
+        table.extend(iter.into_iter().collect());
+        table
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct ClientTableEntry {
     request_number: u32,
     response: Option<Operation>,
@@ -1211,8 +1252,8 @@ mod tests {
             StartViewMessage, StartViewMessageBody,
         },
         replica::{
-            ClientTableEntry, HandleOutput, IDLE_TIMEOUT_MS, Log, LogEntry, OutputAction,
-            PrepareAck, RecoveryAck, RecoveryPrimaryAck, ReplicaStatus, ViewAck,
+            ClientTable, ClientTableEntry, HandleOutput, IDLE_TIMEOUT_MS, Log, LogEntry,
+            OutputAction, PrepareAck, RecoveryAck, RecoveryPrimaryAck, ReplicaStatus, ViewAck,
         },
     };
 
@@ -1394,8 +1435,8 @@ mod tests {
         assert_eq!(replica.log, log);
 
         // client table is correct
-        let mut client_table = HashMap::new();
-        client_table.insert(
+        let mut client_table = ClientTable::new();
+        client_table.add(
             1,
             ClientTableEntry {
                 request_number: 1,
@@ -1418,7 +1459,7 @@ mod tests {
             },
         });
         let mut replica = MockReplicaBuilder::new().build();
-        replica.client_table = HashMap::from_iter([(
+        replica.client_table = ClientTable::from_iter([(
             1,
             ClientTableEntry {
                 request_number: 1,
@@ -1537,8 +1578,8 @@ mod tests {
         assert_eq!(replica.log, log);
 
         // client table is correct
-        let mut client_table = HashMap::new();
-        client_table.insert(
+        let mut client_table = ClientTable::new();
+        client_table.add(
             1,
             ClientTableEntry {
                 request_number: 1,
@@ -1603,7 +1644,7 @@ mod tests {
         let mut replica = MockReplicaBuilder::new().build();
         let operation = usize_as_bytes(0);
         replica.log.append(operation, 1, 1);
-        replica.client_table.insert(
+        replica.client_table.add(
             1,
             ClientTableEntry {
                 request_number: 1,
@@ -1643,8 +1684,8 @@ mod tests {
         );
 
         // client table is correct
-        let mut client_table = HashMap::new();
-        client_table.insert(
+        let mut client_table = ClientTable::new();
+        client_table.add(
             1,
             ClientTableEntry {
                 request_number: 1,
@@ -1676,7 +1717,7 @@ mod tests {
             .build();
         let operation = usize_as_bytes(0);
         replica.log.append(operation, 1, 1);
-        replica.client_table.insert(
+        replica.client_table.add(
             1,
             ClientTableEntry {
                 request_number: 1,
@@ -2067,7 +2108,7 @@ mod tests {
         assert_eq!(replica.commit_number, 1);
         assert_eq!(
             replica.client_table,
-            HashMap::from_iter([(
+            ClientTable::from_iter([(
                 1,
                 ClientTableEntry {
                     request_number: 2,
@@ -2173,7 +2214,7 @@ mod tests {
         assert_eq!(replica.commit_number, 1);
         assert_eq!(
             replica.client_table,
-            HashMap::from_iter([(
+            ClientTable::from_iter([(
                 1,
                 ClientTableEntry {
                     request_number: 2,
@@ -2350,7 +2391,7 @@ mod tests {
         assert_eq!(replica.commit_number, 1);
         assert_eq!(
             replica.client_table,
-            HashMap::from_iter([(
+            ClientTable::from_iter([(
                 1,
                 ClientTableEntry {
                     request_number: 1,
