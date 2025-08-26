@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use bincode::{Decode, Encode};
 use vsr::io::PollIO;
+use vsr::storage::InMemoryStorage;
 use vsr::{ClientOptions, ReplicaOptions, Service, ServiceError};
 
 #[derive(Clone, Debug)]
@@ -63,6 +64,7 @@ fn main() {
             Counter {
                 value: RefCell::new(1),
             },
+            InMemoryStorage::new(),
             io,
         )
         .unwrap();

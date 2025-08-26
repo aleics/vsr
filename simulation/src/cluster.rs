@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
 use crate::{
     env::Env,
@@ -6,7 +6,12 @@ use crate::{
 };
 
 use super::io::{FaultyIO, FaultyIOProbs};
-use vsr::{ClientOptions, ReplicaId, ReplicaOptions, Service, client::Client, replica::Replica};
+use vsr::{
+    ClientOptions, ReplicaId, ReplicaOptions, Service,
+    client::Client,
+    replica::{LogEntry, Replica},
+    storage::LogStorage,
+};
 
 const CLUSTER_IP: &str = "127.0.0.1";
 const REPLICA_BASE_PORT: u32 = 3000;
@@ -18,7 +23,7 @@ pub(crate) struct ClusterOptions {
 }
 
 pub(crate) struct Cluster {
-    pub(crate) replicas: Vec<Replica<SimService, FaultyIO>>,
+    pub(crate) replicas: Vec<Replica<SimService, SimStorage, FaultyIO>>,
     pub(crate) clients: Vec<Client<FaultyIO>>,
 }
 
@@ -63,7 +68,7 @@ fn create_replicas(
     queue: SimQueue,
     lookup: ConnectionLookup,
     options: &ClusterOptions,
-) -> Vec<Replica<SimService, FaultyIO>> {
+) -> Vec<Replica<SimService, SimStorage, FaultyIO>> {
     let mut replicas = Vec::with_capacity(options.replica_count as usize);
 
     for replica in 0..options.replica_count {
@@ -73,6 +78,7 @@ fn create_replicas(
             addresses: addresses.clone(),
         };
         let service = SimService::default();
+        let storage = SimStorage::new();
         let io = FaultyIO::new(
             queue.clone(),
             lookup.clone(),
@@ -80,7 +86,7 @@ fn create_replicas(
             FaultyIOProbs::new_with_seed(&env),
         );
 
-        replicas.push(vsr::replica(&options, service, io).unwrap());
+        replicas.push(vsr::replica(&options, service, storage, io).unwrap());
     }
 
     replicas
@@ -143,5 +149,37 @@ impl Service for SimService {
         *output += 1;
 
         Ok(*output)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SimStorage {
+    logs: HashMap<usize, LogEntry>,
+}
+
+impl SimStorage {
+    fn new() -> Self {
+        SimStorage {
+            logs: HashMap::new(),
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = usize> {
+        self.logs.keys().copied()
+    }
+}
+
+impl LogStorage for SimStorage {
+    fn read(&self, key: usize) -> Option<LogEntry> {
+        self.logs.get(&key).cloned()
+    }
+
+    fn write(&mut self, key: usize, value: LogEntry) -> bool {
+        self.logs.insert(key, value);
+        true
+    }
+
+    fn read_all(&self) -> impl Iterator<Item = LogEntry> {
+        self.keys().flat_map(|key| self.read(key))
     }
 }

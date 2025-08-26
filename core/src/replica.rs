@@ -22,6 +22,7 @@ use crate::{
         RequestMessage, StartViewChangeMessage, StartViewChangeMessageBody, StartViewMessage,
         StartViewMessageBody,
     },
+    storage::LogStorage,
 };
 
 const HEALTH_ID: &str = "replica_health";
@@ -44,7 +45,7 @@ pub(crate) struct ReplicaConfig {
 }
 
 /// A single replica
-pub struct Replica<S, IO: crate::io::IO> {
+pub struct Replica<S, ST, IO: crate::io::IO> {
     /// The current replica number given the configuration.
     replica_number: ReplicaId,
 
@@ -75,7 +76,7 @@ pub struct Replica<S, IO: crate::io::IO> {
 
     /// Log entries of size `operation_number` containing the requests
     /// that have been received so far in their assigned order.
-    log: Log,
+    log: LogStore<ST>,
 
     /// The operation number of the most recently committed operation.
     commit_number: usize,
@@ -99,14 +100,15 @@ pub struct Replica<S, IO: crate::io::IO> {
     health: Timeout,
 }
 
-impl<S, I, IO, O> Replica<S, IO>
+impl<S, ST, I, IO, O> Replica<S, ST, IO>
 where
     S: Service<Input = I, Output = O>,
+    ST: LogStorage,
     I: Decode<()>,
     O: Encode,
     IO: crate::io::IO,
 {
-    pub(crate) fn new(config: &ReplicaConfig, service: S, io: IO) -> Self {
+    pub(crate) fn new(config: &ReplicaConfig, service: S, storage: ST, io: IO) -> Self {
         let bus = ReplicaMessageBus::new(config, io);
         let health = Timeout::new(HEALTH_ID, HEALTH_TICK_COUNT);
 
@@ -116,7 +118,7 @@ where
             total: config.addresses.len() as u8,
             status: ReplicaStatus::Normal,
             operation_number: 0,
-            log: Log::new(),
+            log: LogStore::new(storage),
             commit_number: 0,
             committed_at: Instant::now(),
             prepare_acks: HashMap::default(),
@@ -384,7 +386,7 @@ where
                 return Err(ReplicaError::InvalidState);
             };
 
-            self.execute_operation(operation)?;
+            self.execute_operation(&operation)?;
         }
 
         self.commit_number = prepare.body.commit_number;
@@ -445,7 +447,7 @@ where
             .get_operation(prepare_ok.body.operation_number)
             .expect("Operation not found in log");
 
-        let Some(result) = self.execute_operation(operation)? else {
+        let Some(result) = self.execute_operation(&operation)? else {
             return Ok(HandleOutput::DoNothing);
         };
 
@@ -512,7 +514,7 @@ where
                 return Err(ReplicaError::InvalidState);
             };
 
-            self.execute_operation(operation)?;
+            self.execute_operation(&operation)?;
         }
 
         self.commit_number = commit.body.operation_number;
@@ -573,7 +575,7 @@ where
                 return Err(ReplicaError::InvalidState);
             };
 
-            self.execute_operation(operation)?;
+            self.execute_operation(&operation)?;
         }
         self.commit_number = new_state.body.commit_number;
         self.committed_at = Instant::now();
@@ -594,6 +596,8 @@ where
             self.status = ReplicaStatus::ViewChange;
         }
 
+        let log = self.log.read_all();
+
         // The current primary won't send a `DoViewChange` message to itself.
         // It will acknowledge the view change and wait for `DoViewChange` messages.
         if self.is_primary() {
@@ -601,7 +605,7 @@ where
                 old_view,
                 operation_number: self.operation_number,
                 commit_number: self.commit_number,
-                log: self.log.clone(),
+                log,
             });
             return Ok(HandleOutput::DoNothing);
         }
@@ -613,7 +617,7 @@ where
             body: DoViewChangeMessageBody {
                 old_view,
                 new_view: self.view,
-                log: self.log.clone(),
+                log,
                 operation_number: self.operation_number,
                 commit_number: self.commit_number,
                 replica: self.replica_number,
@@ -652,7 +656,7 @@ where
 
         self.status = ReplicaStatus::Normal;
 
-        self.log = new_view.log;
+        self.log.overwrite(new_view.log);
         self.operation_number = new_view.operation_number;
 
         let mut actions = Vec::new();
@@ -705,7 +709,7 @@ where
             header: Header { view: self.view },
             body: StartViewMessageBody {
                 replica: self.replica_number,
-                log: self.log.clone(),
+                log: self.log.read_all(),
                 operation_number: self.operation_number,
                 commit_number: self.commit_number,
             },
@@ -723,7 +727,7 @@ where
         // Refresh internal state with the new view
         self.status = ReplicaStatus::Normal;
         self.view = start_view.header.view;
-        self.log = start_view.body.log;
+        self.log.overwrite(start_view.body.log);
         self.operation_number = start_view.body.operation_number;
 
         let mut actions = Vec::new();
@@ -783,7 +787,7 @@ where
                     replica: self.replica_number,
                     nonce: recovery.body.nonce,
                     primary: Some(RecoveryPrimaryResponse {
-                        log: self.log.clone(),
+                        log: self.log.read_all(),
                         operation_number: self.operation_number,
                         commit_number: self.commit_number,
                     }),
@@ -853,7 +857,7 @@ where
 
         self.view = *view;
         self.operation_number = *operation_number;
-        self.log = log.clone();
+        self.log.overwrite(log.clone());
 
         // Execute previous committed operations by checking the log
         let recovery_commit_number = *commit_number;
@@ -1020,48 +1024,68 @@ fn nonce() -> u64 {
     now.duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 pub(crate) struct Log {
-    /// A queue of log entries for each request sent to the replica.
     entries: Vec<LogEntry>,
 }
 
-impl Log {
-    fn new() -> Self {
-        Log {
-            entries: Vec::new(),
-        }
+#[derive(Debug)]
+struct LogStore<S> {
+    /// A queue of log entries for each request sent to the replica.
+    storage: S,
+    size: usize,
+}
+
+impl<ST: LogStorage> LogStore<ST> {
+    fn new(storage: ST) -> Self {
+        LogStore { storage, size: 0 }
     }
 
     fn append(&mut self, operation: Operation, request_number: u32, client_id: ClientId) {
-        self.entries.push(LogEntry {
+        let key = self.size;
+        let value = LogEntry {
             request_number,
             client_id,
             operation,
-        });
+        };
+
+        self.add(key, value);
     }
 
-    fn get_operation(&self, operation_number: usize) -> Option<&Operation> {
+    fn add(&mut self, operation_number: usize, entry: LogEntry) {
+        self.storage.write(operation_number, entry); // TODO: handle this
+        self.size += 1;
+    }
+
+    fn add_next(&mut self, entry: LogEntry) {
+        let operation_number = self.size;
+
+        self.storage.write(operation_number, entry); // TODO: handle this
+        self.size += 1;
+    }
+
+    fn get_operation(&self, operation_number: usize) -> Option<Operation> {
         self.get_entry(operation_number)
-            .map(|entry| &entry.operation)
+            .map(|entry| entry.operation)
     }
 
-    fn get_entry(&self, operation_number: usize) -> Option<&LogEntry> {
+    fn get_entry(&self, operation_number: usize) -> Option<LogEntry> {
         // The operation number is a 1-based counter. Thus, we need to subtract 1 to get
         // the associated index
-        self.entries.get(operation_number - 1)
+        let key = operation_number - 1;
+        self.storage.read(key)
     }
 
     fn since(&self, operation_number: usize) -> Log {
-        if operation_number >= self.entries.len() {
-            return Log::new();
+        if operation_number >= self.size {
+            return Log::default();
         }
 
         let mut entries = Vec::new();
         for i in operation_number..self.size() {
             let entry = self
-                .entries
-                .get(i)
+                .storage
+                .read(i)
                 .expect("Log entry must be inside boundaries");
 
             entries.push(entry.clone());
@@ -1071,18 +1095,35 @@ impl Log {
     }
 
     fn merge(&mut self, log: Log) {
-        for entry in log.entries {
-            self.entries.push(entry);
+        for value in log.entries {
+            self.add_next(value);
         }
     }
 
     fn size(&self) -> usize {
-        self.entries.len()
+        self.size
+    }
+
+    fn read_all(&self) -> Log {
+        let mut entries = Vec::new();
+        for i in 0..self.size() {
+            if let Some(entry) = self.storage.read(i) {
+                entries.push(entry.clone());
+            }
+        }
+        Log { entries }
+    }
+
+    fn overwrite(&mut self, log: Log) {
+        self.size = log.entries.len();
+
+        let values = log.entries.into_iter().enumerate();
+        self.storage.write_all(values); // TODO: handle this
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-struct LogEntry {
+pub struct LogEntry {
     /// The request number of the log.
     request_number: u32,
     /// The client ID that triggered the request.
@@ -1252,9 +1293,10 @@ mod tests {
             StartViewMessage, StartViewMessageBody,
         },
         replica::{
-            ClientTable, ClientTableEntry, HandleOutput, IDLE_TIMEOUT_MS, Log, LogEntry,
+            ClientTable, ClientTableEntry, HandleOutput, IDLE_TIMEOUT_MS, Log, LogEntry, LogStore,
             OutputAction, PrepareAck, RecoveryAck, RecoveryPrimaryAck, ReplicaStatus, ViewAck,
         },
+        storage::InMemoryStorage,
     };
 
     use super::{Replica, Service, ServiceError};
@@ -1352,7 +1394,7 @@ mod tests {
             self
         }
 
-        fn build(self) -> Replica<MockService, MockIO> {
+        fn build(self) -> Replica<MockService, InMemoryStorage, MockIO> {
             let total = self.addresses.len();
             assert!(total > 0);
 
@@ -1364,7 +1406,7 @@ mod tests {
 
             let config = options.parse().unwrap();
 
-            Replica::new(&config, MockService, MockIO)
+            Replica::new(&config, MockService, InMemoryStorage::new(), MockIO)
         }
     }
 
@@ -1430,9 +1472,9 @@ mod tests {
         assert_eq!(replica.commit_number, 0);
 
         // log is correct
-        let mut log = Log::new();
+        let mut log = LogStore::new(InMemoryStorage::new());
         log.append(operation, 1, 1);
-        assert_eq!(replica.log, log);
+        assert_eq!(replica.log.read_all(), log.read_all());
 
         // client table is correct
         let mut client_table = ClientTable::new();
@@ -1573,9 +1615,9 @@ mod tests {
         assert_eq!(replica.commit_number, 0);
 
         // log is correct
-        let mut log = Log::new();
+        let mut log = LogStore::new(InMemoryStorage::new());
         log.append(operation, 1, 1);
-        assert_eq!(replica.log, log);
+        assert_eq!(replica.log.read_all(), log.read_all());
 
         // client table is correct
         let mut client_table = ClientTable::new();
@@ -1896,11 +1938,11 @@ mod tests {
         assert_eq!(replica.commit_number, 2);
 
         // log is correct
-        let mut log = Log::new();
+        let mut log = LogStore::new(InMemoryStorage::new());
         log.append(usize_as_bytes(0), 1, 1);
         log.append(usize_as_bytes(1), 2, 1);
         log.append(usize_as_bytes(2), 3, 1);
-        assert_eq!(replica.log, log);
+        assert_eq!(replica.log.read_all(), log.read_all());
     }
 
     #[test]
@@ -2040,9 +2082,20 @@ mod tests {
     #[test]
     fn test_handle_do_view_change() {
         // given
-        let mut message_log = Log::new();
-        message_log.append(usize_as_bytes(0), 1, 1);
-        message_log.append(usize_as_bytes(1), 2, 1);
+        let message_log = Log {
+            entries: vec![
+                LogEntry {
+                    request_number: 1,
+                    client_id: 1,
+                    operation: usize_as_bytes(0),
+                },
+                LogEntry {
+                    request_number: 2,
+                    client_id: 1,
+                    operation: usize_as_bytes(1),
+                },
+            ],
+        };
         let do_view_change = Message::DoViewChange(DoViewChangeMessage {
             header: Header { view: 1 },
             body: DoViewChangeMessageBody {
@@ -2104,7 +2157,7 @@ mod tests {
 
         // state is correct
         assert_eq!(replica.operation_number, 2);
-        assert_eq!(replica.log, message_log.clone());
+        assert_eq!(replica.log.read_all(), message_log.clone());
         assert_eq!(replica.commit_number, 1);
         assert_eq!(
             replica.client_table,
@@ -2121,9 +2174,20 @@ mod tests {
     #[test]
     fn test_handle_do_view_change_waits_for_quorum() {
         // given
-        let mut message_log = Log::new();
-        message_log.append(usize_as_bytes(0), 1, 1);
-        message_log.append(usize_as_bytes(1), 2, 1);
+        let message_log = Log {
+            entries: vec![
+                LogEntry {
+                    request_number: 1,
+                    client_id: 1,
+                    operation: usize_as_bytes(0),
+                },
+                LogEntry {
+                    request_number: 2,
+                    client_id: 1,
+                    operation: usize_as_bytes(1),
+                },
+            ],
+        };
         let do_view_change = Message::DoViewChange(DoViewChangeMessage {
             header: Header { view: 1 },
             body: DoViewChangeMessageBody {
@@ -2168,9 +2232,20 @@ mod tests {
     #[test]
     fn test_handle_start_view() {
         // given
-        let mut message_log = Log::new();
-        message_log.append(usize_as_bytes(0), 1, 1);
-        message_log.append(usize_as_bytes(1), 2, 1);
+        let message_log = Log {
+            entries: vec![
+                LogEntry {
+                    request_number: 1,
+                    client_id: 1,
+                    operation: usize_as_bytes(0),
+                },
+                LogEntry {
+                    request_number: 2,
+                    client_id: 1,
+                    operation: usize_as_bytes(1),
+                },
+            ],
+        };
 
         let mut replica = MockReplicaBuilder::new().build();
         replica.view = 0;
@@ -2209,7 +2284,7 @@ mod tests {
         // state is correct
         assert_eq!(replica.status, ReplicaStatus::Normal);
         assert_eq!(replica.view, 1);
-        assert_eq!(replica.log, message_log.clone());
+        assert_eq!(replica.log.read_all(), message_log.clone());
         assert_eq!(replica.operation_number, 2);
         assert_eq!(replica.commit_number, 1);
         assert_eq!(
@@ -2289,7 +2364,7 @@ mod tests {
                         replica: 0,
                         nonce: 1234,
                         primary: Some(RecoveryPrimaryResponse {
-                            log: replica.log.clone(),
+                            log: replica.log.read_all(),
                             operation_number: 2,
                             commit_number: 1
                         })
@@ -2340,9 +2415,20 @@ mod tests {
     #[test]
     fn test_handle_recovery_response() {
         // given
-        let mut log = Log::new();
-        log.append(usize_as_bytes(0), 1, 1);
-        log.append(usize_as_bytes(1), 2, 1);
+        let log = Log {
+            entries: vec![
+                LogEntry {
+                    request_number: 1,
+                    client_id: 1,
+                    operation: usize_as_bytes(0),
+                },
+                LogEntry {
+                    request_number: 2,
+                    client_id: 1,
+                    operation: usize_as_bytes(1),
+                },
+            ],
+        };
 
         let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
             header: Header { view: 2 },
@@ -2387,7 +2473,7 @@ mod tests {
         // state is correct
         assert_eq!(replica.view, 2);
         assert_eq!(replica.operation_number, 2);
-        assert_eq!(replica.log, log);
+        assert_eq!(replica.log.read_all(), log);
         assert_eq!(replica.commit_number, 1);
         assert_eq!(
             replica.client_table,
@@ -2405,9 +2491,20 @@ mod tests {
     #[test]
     fn test_handle_recovery_response_waits_for_quorum() {
         // given
-        let mut log = Log::new();
-        log.append(usize_as_bytes(0), 1, 1);
-        log.append(usize_as_bytes(1), 2, 1);
+        let log = Log {
+            entries: vec![
+                LogEntry {
+                    request_number: 1,
+                    client_id: 1,
+                    operation: usize_as_bytes(0),
+                },
+                LogEntry {
+                    request_number: 2,
+                    client_id: 1,
+                    operation: usize_as_bytes(1),
+                },
+            ],
+        };
 
         let recovery_response = Message::RecoveryResponse(RecoveryResponseMessage {
             header: Header { view: 2 },
@@ -2449,7 +2546,7 @@ mod tests {
     #[test]
     fn test_handle_recovery_response_waits_for_primary_ack() {
         // given
-        let mut log = Log::new();
+        let mut log = LogStore::new(InMemoryStorage::new());
         log.append(usize_as_bytes(0), 1, 1);
         log.append(usize_as_bytes(1), 2, 1);
 

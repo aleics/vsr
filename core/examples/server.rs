@@ -1,7 +1,7 @@
 use std::thread;
 
 use clap::{Parser, command};
-use vsr::{ReplicaOptions, Service, io::PollIO, replica::Replica};
+use vsr::{ReplicaOptions, Service, io::PollIO, replica::Replica, storage::InMemoryStorage};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -25,9 +25,9 @@ impl Service for EchoService {
     }
 }
 
-fn start_replica(options: &ReplicaOptions) -> Replica<EchoService, PollIO> {
+fn start_replica(options: &ReplicaOptions) -> Replica<EchoService, InMemoryStorage, PollIO> {
     let io = PollIO::new().unwrap();
-    let mut replica = vsr::replica(options, EchoService, io).unwrap();
+    let mut replica = vsr::replica(options, EchoService, InMemoryStorage::new(), io).unwrap();
     replica.init().unwrap();
 
     replica

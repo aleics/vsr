@@ -8,6 +8,8 @@ use message::Operation;
 use replica::{Replica, ReplicaConfig, ReplicaError};
 use thiserror::Error;
 
+use crate::storage::LogStorage;
+
 mod bus;
 mod checksum;
 pub mod client;
@@ -15,6 +17,7 @@ mod clock;
 pub mod io;
 mod message;
 pub mod replica;
+pub mod storage;
 
 pub type ReplicaId = u8;
 pub type ClientId = u128;
@@ -77,13 +80,21 @@ impl ClientOptions {
 }
 
 /// Create a new replica given certain options and a service.
-pub fn replica<S: Service<Input = I, Output = O>, I: Decode<()>, O: Encode, IO: crate::io::IO>(
+pub fn replica<S, ST, I, O, IO>(
     options: &ReplicaOptions,
     service: S,
+    storage: ST,
     io: IO,
-) -> Result<Replica<S, IO>, ReplicaError> {
+) -> Result<Replica<S, ST, IO>, ReplicaError>
+where
+    S: Service<Input = I, Output = O>,
+    ST: LogStorage,
+    I: Decode<()>,
+    O: Encode,
+    IO: crate::io::IO,
+{
     let config = options.parse().unwrap();
-    Ok(Replica::new(&config, service, io))
+    Ok(Replica::new(&config, service, storage, io))
 }
 
 /// Create a new client given certain options and known `view`.
