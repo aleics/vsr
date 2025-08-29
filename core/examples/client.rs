@@ -35,6 +35,8 @@ fn start_client(options: &ClientOptions) -> Client<PollIO> {
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     let args = Args::parse();
     let client_id = random(args.seed);
     let options = ClientOptions {
@@ -45,13 +47,16 @@ fn main() {
     };
 
     let mut client = start_client(&options);
-    println!("Starting client (id: {client_id})...");
+    tracing::info!("[client::main] Starting client (id: {client_id})...");
 
     while !client.is_ready() {
         client.tick::<i32>().unwrap();
     }
 
-    println!("Client is ready in address {}!", options.address);
+    tracing::info!(
+        "[client::main] Client is ready in address {}!",
+        options.address
+    );
 
     let (tx, rx) = mpsc::channel();
 
@@ -65,7 +70,7 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from stdin: {e}");
+                    tracing::error!("[client::main] Error reading from stdin: {e}");
                     break;
                 }
             }
@@ -78,7 +83,7 @@ fn main() {
         }
 
         for response in client.tick::<String>().unwrap() {
-            println!("Server: \"{response}\"");
+            tracing::info!("[client::main] Server: \"{response}\"");
         }
     }
 }

@@ -20,7 +20,6 @@ impl Service for EchoService {
     type Output = String;
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, vsr::ServiceError> {
-        println!("message received {input}");
         Ok(format!("echo \"{input}\""))
     }
 }
@@ -34,6 +33,8 @@ fn start_replica(options: &ReplicaOptions) -> Replica<EchoService, InMemoryStora
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     let args = Args::parse();
 
     let total = args.addresses.len();
@@ -49,7 +50,7 @@ fn main() {
         let mut replica = start_replica(&options);
 
         handles.push(thread::spawn(move || {
-            println!("Replica {replica_number} running...");
+            tracing::info!("[server::main] Replica {replica_number} running...");
             replica.run().unwrap();
         }));
     }

@@ -251,6 +251,12 @@ where
     }
 
     fn handle_message(&mut self, message: Message) -> Result<HandleOutput, ReplicaError> {
+        tracing::debug!(
+            "[Replica::handle_message] Received message (message: {:?}, replica: {})",
+            message,
+            self.replica_number
+        );
+
         match message {
             Message::Request(request) => self.handle_request(request),
             Message::Prepare(prepare) => self.handle_prepare(prepare),
