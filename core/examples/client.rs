@@ -4,7 +4,7 @@ use std::{
     thread,
 };
 
-use clap::{Parser, command};
+use clap::Parser;
 use rand::Rng;
 use vsr::{ClientOptions, client::Client, io::PollIO};
 

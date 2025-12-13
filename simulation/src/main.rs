@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use clap::{Parser, command};
+use clap::Parser;
 use vsr::{client::ClientError, replica::ReplicaError};
 
 use crate::{

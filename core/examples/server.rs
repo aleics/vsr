@@ -1,6 +1,6 @@
 use std::thread;
 
-use clap::{Parser, command};
+use clap::Parser;
 use vsr::{ReplicaOptions, Service, io::PollIO, replica::Replica, storage::InMemoryStorage};
 
 #[derive(Parser, Debug)]

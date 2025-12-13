@@ -4,17 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aegis = "0.9.0"
-aead = "0.5.2"
-bincode = "2.0.1"
-bytes = "1.10.1"
-mio = { version = "1.0.4", features = ["os-poll", "net"] }
-rand = "0.9.1"
-rand_chacha = "0.9.0"
-tracing = "0.1.41"
-thiserror = "2.0.12"
+aegis = "0.9"
+aead = "0.5"
+bincode = "2"
+bytes = "1.10"
+mio = { version = "1", features = ["os-poll", "net"] }
+rand = "0.9"
+rand_chacha = "0.9"
+tracing = "0.1"
+thiserror = "2"
 
 [dev-dependencies]
-clap = { version = "4.5.41", features = ["derive"] }
-lazy_static = "1.5.0"
-tracing-subscriber = "0.3.19"
+clap = { version = "4.5", features = ["derive"] }
+lazy_static = "1.5"
+tracing-subscriber = "0.3"
