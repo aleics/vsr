@@ -1,5 +1,5 @@
 # vsr
-A library for distributed systems based on the [Viewstamped Replication Revisited](https://pmg.csail.mit.edu/pubs/liskov12vr-abstract.html) technique.
+A library for distributed systems based on the [Viewstamped Replication Revisited](https://dspace.mit.edu/handle/1721.1/71763) replication technique.
 
 The current implementation supports all the protocols (_normal_, _view change_, _recovery_), as described in the original paper.
 
